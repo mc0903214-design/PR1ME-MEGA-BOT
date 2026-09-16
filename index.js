@@ -10,6 +10,15 @@ const sharp = require('sharp');
 // Configure FFmpeg path
 ffmpeg.setFfmpegPath(ffmpegPath);
 
+// Catch unhandled exceptions to keep the bot process alive
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT EXCEPTION]', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[UNHANDLED REJECTION]', reason);
+});
+
 // ==========================================
 // CONFIGURATION & ENVIRONMENT
 // ==========================================
@@ -35,6 +44,34 @@ const bot = new Telegraf(BOT_TOKEN);
 const userSessions = new Map(); // chatId -> Session State
 const globalQueue = [];
 let activeJobsCount = 0;
+
+// Escape characters reserved by Telegram MarkdownV2
+function escapeMarkdownV2(text) {
+  if (!text) return '';
+  return String(text).replace(/[_*\[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
+}
+
+// Safe reply wrapper helper
+async function safeReply(ctx, text, extra = {}) {
+  try {
+    return await ctx.reply(text, { parse_mode: 'MarkdownV2', ...extra });
+  } catch (err) {
+    // Fallback to plain text if Markdown parsing fails
+    const plainText = text.replace(/\\([_*\[\]()~`>#+\-=|{}.!\\])/g, '$1');
+    return await ctx.reply(plainText, extra);
+  }
+}
+
+// Safe edit wrapper helper
+async function safeEditMessageText(ctx, text, extra = {}) {
+  try {
+    return await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', ...extra });
+  } catch (err) {
+    if (err.message && err.message.includes('message is not modified')) return;
+    const plainText = text.replace(/\\([_*\[\]()~`>#+\-=|{}.!\\])/g, '$1');
+    return await ctx.editMessageText(plainText, extra);
+  }
+}
 
 // Helper: Generate safe fallback ID
 const generateId = () => crypto.randomBytes(6).toString('hex');
@@ -97,8 +134,7 @@ function isValidMegaUrl(urlStr) {
   try {
     const parsed = new URL(urlStr);
     const host = parsed.hostname.toLowerCase();
-    if (!host.endsWith('mega.nz') && !host.endsWith('mega.co.nz')) return false;
-    return true;
+    return host.endsWith('mega.nz') || host.endsWith('mega.co.nz');
   } catch (e) {
     return false;
   }
@@ -112,11 +148,11 @@ function getOrCreateSession(chatId) {
     userSessions.set(chatId, {
       sid: generateId(),
       chatId,
-      megaNode: null,       // Root Mega Node
-      currentPath: [],       // Array of index pointers or sub-nodes
+      megaNode: null,          // Root Mega Node
+      currentPath: [],          // Array of index pointers or sub-nodes
       selectedFiles: new Set(), // Set of Node IDs selected
       currentPage: 0,
-      activeJob: null,       // Active download job
+      activeJob: null,          // Active download job
       lastMessageId: null
     });
   }
@@ -189,20 +225,74 @@ function mapMegaTree(node) {
   return item;
 }
 
-// Load attributes and structure from megajs node
-async function loadMegaStructure(urlStr) {
-  const node = MegaFile.fromURL(urlStr);
+// Find subfolder recursively inside loaded tree
+function findSubfolderNode(node, targetSubfolderId) {
+  if (!node) return null;
+  const currentId = node.handle || node.downloadId;
+  if (currentId === targetSubfolderId) {
+    return node;
+  }
+  if (node.children && Array.isArray(node.children)) {
+    for (const child of node.children) {
+      const found = findSubfolderNode(child, targetSubfolderId);
+      if (found) return found;
+    }
+  }
+  return null;
+}
 
-  await new Promise((resolve, reject) => {
+// Parse MEGA URLs including subfolders properly
+function parseMegaUrlDetails(urlStr) {
+  const parsed = new URL(urlStr);
+  let subfolderId = null;
+
+  if (parsed.searchParams.has('folder')) {
+    subfolderId = parsed.searchParams.get('folder');
+  }
+
+  let hash = parsed.hash || '';
+  if (hash.startsWith('#')) hash = hash.substring(1);
+
+  let cleanUrl = urlStr;
+
+  if (hash.includes('/folder/') || hash.includes('!folder!') || hash.includes('/file/') || hash.includes('!file!')) {
+    const parts = hash.split(/\/folder\/|!folder!|\/file\/|!file!/);
+    const key = parts[0];
+    subfolderId = parts[1];
+
+    const basePath = parsed.origin + parsed.pathname;
+    cleanUrl = `${basePath}#${key}`;
+  }
+
+  return { cleanUrl, subfolderId };
+}
+
+// Load attributes and structure from megajs node safely
+async function loadMegaStructure(urlStr) {
+  const { cleanUrl, subfolderId } = parseMegaUrlDetails(urlStr);
+
+  const node = MegaFile.fromURL(cleanUrl);
+
+  const loadedNode = await new Promise((resolve, reject) => {
     node.loadAttributes((err, loaded) => {
       if (err) return reject(err);
       resolve(loaded || node);
     });
   });
 
-  const mapped = mapMegaTree(node);
+  let targetNode = loadedNode;
 
-  // Single file fallback: wrap standalone file node into root container for browser UI consistency
+  if (subfolderId) {
+    const foundSub = findSubfolderNode(loadedNode, subfolderId);
+    if (foundSub) {
+      targetNode = foundSub;
+    } else {
+      throw new Error(`Requested subfolder/file ID "${subfolderId}" was not found in the MEGA folder structure.`);
+    }
+  }
+
+  const mapped = mapMegaTree(targetNode);
+
   if (!mapped.directory) {
     return {
       id: 'root_container',
@@ -222,10 +312,15 @@ async function loadMegaStructure(urlStr) {
 // ==========================================
 function buildBrowserUI(session) {
   const currentNode = getCurrentDirectoryNode(session);
-  if (!currentNode) return { text: 'No content available.', keyboard: Markup.inlineKeyboard([]) };
+  if (!currentNode) {
+    return {
+      text: escapeMarkdownV2('No content available.'),
+      keyboard: Markup.inlineKeyboard([])
+    };
+  }
 
   let titlePath = '/' + session.currentPath.join('/');
-  let text = `📁 *MEGA File Browser*\n📍 *Path:* \`${titlePath}\`\n\n`;
+  let text = `📁 *MEGA File Browser*\n📍 *Path:* \`${escapeMarkdownV2(titlePath)}\`\n\n`;
 
   const items = currentNode.children || [];
 
@@ -238,7 +333,7 @@ function buildBrowserUI(session) {
   const keyboard = [];
 
   if (pageItems.length === 0) {
-    text += `_This folder is empty._\n`;
+    text += `_This folder is empty\\._\n`;
   } else {
     pageItems.forEach(item => {
       const isSelected = session.selectedFiles.has(item.id);
@@ -303,9 +398,9 @@ async function renderOrUpdateBrowser(ctx, session) {
   const ui = buildBrowserUI(session);
   try {
     if (ctx.callbackQuery) {
-      await ctx.editMessageText(ui.text, { parse_mode: 'Markdown', ...ui.keyboard });
+      await safeEditMessageText(ctx, ui.text, ui.keyboard);
     } else {
-      const msg = await ctx.reply(ui.text, { parse_mode: 'Markdown', ...ui.keyboard });
+      const msg = await safeReply(ctx, ui.text, ui.keyboard);
       session.lastMessageId = msg.message_id;
     }
   } catch (err) {
@@ -548,15 +643,16 @@ async function executeJob(job) {
 
         const ext = path.extname(fileName).toLowerCase();
         const readStream = fs.createReadStream(finalFilePath);
+        const safeCaption = `*${escapeMarkdownV2(fileName)}*\nSize: ${escapeMarkdownV2(formatBytes(finalSize))}`;
 
         if (['.mp4', '.mkv', '.avi', '.mov'].includes(ext)) {
-          await ctx.replyWithVideo({ source: readStream, filename: fileName }, { caption: `🎬 *${fileName}*\nSize: ${formatBytes(finalSize)}`, parse_mode: 'Markdown' });
+          await ctx.replyWithVideo({ source: readStream, filename: fileName }, { caption: `🎬 ${safeCaption}`, parse_mode: 'MarkdownV2' });
         } else if (['.jpg', '.jpeg', '.png', '.webp'].includes(ext)) {
-          await ctx.replyWithPhoto({ source: readStream }, { caption: `🖼 *${fileName}*` });
+          await ctx.replyWithPhoto({ source: readStream }, { caption: `🖼 *${escapeMarkdownV2(fileName)}*`, parse_mode: 'MarkdownV2' });
         } else if (['.mp3', '.m4a', '.flac', '.wav'].includes(ext)) {
-          await ctx.replyWithAudio({ source: readStream, filename: fileName }, { caption: `🎵 *${fileName}*` });
+          await ctx.replyWithAudio({ source: readStream, filename: fileName }, { caption: `🎵 *${escapeMarkdownV2(fileName)}*`, parse_mode: 'MarkdownV2' });
         } else {
-          await ctx.replyWithDocument({ source: readStream, filename: fileName }, { caption: `📄 *${fileName}*\nSize: ${formatBytes(finalSize)}`, parse_mode: 'Markdown' });
+          await ctx.replyWithDocument({ source: readStream, filename: fileName }, { caption: `📄 ${safeCaption}`, parse_mode: 'MarkdownV2' });
         }
 
         processedCount++;
@@ -579,29 +675,29 @@ async function executeJob(job) {
       summary += `❌ *Failed:* ${failedCount}\n\n`;
 
       if (processedCount > 0) {
-        summary += `📊 *Original Total Size:* ${formatBytes(totalOriginalBytes)}\n`;
-        summary += `📉 *Final Sent Size:* ${formatBytes(totalFinalBytes)}\n`;
+        summary += `📊 *Original Total Size:* ${escapeMarkdownV2(formatBytes(totalOriginalBytes))}\n`;
+        summary += `📉 *Final Sent Size:* ${escapeMarkdownV2(formatBytes(totalFinalBytes))}\n`;
         const saved = totalOriginalBytes - totalFinalBytes;
         if (saved > 0) {
-          summary += `💡 *Space Saved:* ${formatBytes(saved)}\n`;
+          summary += `💡 *Space Saved:* ${escapeMarkdownV2(formatBytes(saved))}\n`;
         }
       }
 
       if (failedFiles.length > 0) {
         summary += `\n⚠️ *Failed Files Details:*\n`;
         failedFiles.forEach(f => {
-          summary += `• *${f.name}*: ${f.reason}\n`;
+          summary += `• *${escapeMarkdownV2(f.name)}*: ${escapeMarkdownV2(f.reason)}\n`;
         });
       }
 
-      await ctx.reply(summary, { parse_mode: 'Markdown' });
+      await safeReply(ctx, summary);
     } else {
-      await ctx.reply('❌ *Job was cancelled by user. Temporary files cleaned up.*', { parse_mode: 'Markdown' });
+      await safeReply(ctx, '❌ *Job was cancelled by user\\. Temporary files cleaned up\\.*');
     }
 
   } catch (err) {
     console.error('[CRITICAL JOB ERROR]', err);
-    await ctx.reply(`❌ *An unexpected error occurred during processing:* ${err.message}`, { parse_mode: 'Markdown' });
+    await safeReply(ctx, `❌ *An unexpected error occurred during processing:* ${escapeMarkdownV2(err.message)}`);
   } finally {
     activeJobsCount--;
     session.activeJob = null;
@@ -630,21 +726,21 @@ function createThrottledProgressUpdater(ctx, job) {
     lastUpdate = now;
 
     const bar = renderProgressBar(percent);
-    let msg = `${job.status}\n\n`;
-    msg += `📄 *File:* \`${job.currentFileName}\` (${job.currentIndex}/${job.totalFiles})\n`;
+    let msg = `${escapeMarkdownV2(job.status)}\n\n`;
+    msg += `📄 *File:* \`${escapeMarkdownV2(job.currentFileName)}\` (${job.currentIndex}/${job.totalFiles})\n`;
     if (total > 0 && currentBytes > 0) {
-      msg += `📊 *Progress:* ${formatBytes(currentBytes)} / ${formatBytes(total)}\n`;
+      msg += `📊 *Progress:* ${escapeMarkdownV2(formatBytes(currentBytes))} / ${escapeMarkdownV2(formatBytes(total))}\n`;
     }
-    msg += `[${bar}] *${percent}%*\n`;
+    msg += `[${escapeMarkdownV2(bar)}] *${percent}%*\n`;
     if (extraInfo) {
-      msg += `\n${extraInfo}`;
+      msg += `\n${escapeMarkdownV2(extraInfo)}`;
     }
 
     try {
       if (job.progressMsgId) {
-        await ctx.telegram.editMessageText(ctx.chat.id, job.progressMsgId, null, msg, { parse_mode: 'Markdown' });
+        await ctx.telegram.editMessageText(ctx.chat.id, job.progressMsgId, null, msg, { parse_mode: 'MarkdownV2' }).catch(() => {});
       } else {
-        const sent = await ctx.reply(msg, { parse_mode: 'Markdown' });
+        const sent = await safeReply(ctx, msg);
         job.progressMsgId = sent.message_id;
       }
     } catch (err) {
@@ -663,31 +759,31 @@ function createThrottledProgressUpdater(ctx, job) {
 bot.start(async (ctx) => {
   const session = await resetSession(ctx.chat.id);
   const welcomeText = `📥 *MEGA Downloader Bot*\n\n` +
-    `Send me any MEGA.nz file or folder link and I'll let you browse the contents and download them directly here in Telegram.\n\n` +
+    `Send me any MEGA\\.nz file or folder link and I'll let you browse the contents and download them directly here in Telegram\\.\n\n` +
     `*Features:*\n` +
     `• Browse deep folder hierarchies\n` +
     `• Select individual or multiple files\n` +
     `• Download full folders with recursive search\n` +
-    `• Smart media optimization (FFmpeg & Sharp)\n` +
+    `• Smart media optimization \\(FFmpeg & Sharp\\)\n` +
     `• Queue management & active progress bars\n\n` +
-    `*Send a MEGA link to begin!*`;
+    `*Send a MEGA link to begin\\!*`;
 
-  await ctx.reply(welcomeText, { parse_mode: 'Markdown' });
+  await safeReply(ctx, welcomeText);
 });
 
 // /help Command
 bot.help(async (ctx) => {
   const helpText = `❓ *Help & Usage Guide*\n\n` +
-    `1. *Paste a MEGA Link:* Send any public MEGA.nz file or folder URL.\n` +
-    `2. *Navigate Folders:* Use inline keyboard buttons to explore folders.\n` +
-    `3. *Selection:* Click on files with ` + '`☐`' + ` to select them for batch download.\n` +
-    `4. *Download Options:*\n` +
-    `   • *Download Folder:* Recursively fetches all files inside.\n` +
-    `   • *Download Selected:* Downloads items you explicitly checked.\n` +
-    `5. *Optimization:* Videos & Images are smartly compressed to stay within Telegram upload limits while maintaining high visual quality.\n` +
-    `6. *Cancel:* Type /cancel at any time to halt downloads and purge temp files.`;
+    `1\\. *Paste a MEGA Link:* Send any public MEGA\\.nz file or folder URL\\.\n` +
+    `2\\. *Navigate Folders:* Use inline keyboard buttons to explore folders\\.\n` +
+    `3\\. *Selection:* Click on files with \`☐\` to select them for batch download\\.\n` +
+    `4\\. *Download Options:*\n` +
+    `   • *Download Folder:* Recursively fetches all files inside\\.\n` +
+    `   • *Download Selected:* Downloads items you explicitly checked\\.\n` +
+    `5\\. *Optimization:* Videos & Images are smartly compressed to stay within Telegram upload limits while maintaining high visual quality\\.\n` +
+    `6\\. *Cancel:* Type /cancel at any time to halt downloads and purge temp files\\.`;
 
-  await ctx.reply(helpText, { parse_mode: 'Markdown' });
+  await safeReply(ctx, helpText);
 });
 
 // /cancel Command
@@ -698,9 +794,9 @@ bot.command('cancel', async (ctx) => {
     if (session.activeJob.ffmpegProc) {
       try { session.activeJob.ffmpegProc.kill('SIGKILL'); } catch (e) {}
     }
-    await ctx.reply('🛑 *Cancel signal sent. Cleaning up current operations...*', { parse_mode: 'Markdown' });
+    await safeReply(ctx, '🛑 *Cancel signal sent\\. Cleaning up current operations\\.\\.\\.*');
   } else {
-    await ctx.reply('ℹ️ *No active download job running.*', { parse_mode: 'Markdown' });
+    await safeReply(ctx, 'ℹ️ *No active download job running\\.*');
   }
 });
 
@@ -710,21 +806,25 @@ bot.on('text', async (ctx) => {
 
   // Validate MEGA link URL format
   if (!isValidMegaUrl(text)) {
-    return ctx.reply('⚠️ Please send a valid MEGA.nz link (e.g., `https://mega.nz/folder/...` or `https://mega.nz/file/...`)', { parse_mode: 'Markdown' });
+    return safeReply(ctx, '⚠️ Please send a valid MEGA\\.nz link \\(e\\.g\\., `https://mega.nz/folder/...` or `https://mega.nz/file/...`\\)');
   }
 
   const session = await resetSession(ctx.chat.id);
-  const loadingMsg = await ctx.reply('🔍 *Inspecting MEGA link and loading structure...*', { parse_mode: 'Markdown' });
+  const loadingMsg = await safeReply(ctx, '🔍 *Inspecting MEGA link and loading structure\\.\\.\\.*');
 
   try {
     session.megaNode = await loadMegaStructure(text);
-    await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+    if (loadingMsg && loadingMsg.message_id) {
+      await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+    }
     await renderOrUpdateBrowser(ctx, session);
 
   } catch (err) {
     console.error('[LINK PARSE ERROR]', err.message);
-    await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
-    await ctx.reply(`❌ *Failed to access MEGA link:* ${err.message}\nEnsure the link is public and valid.`, { parse_mode: 'Markdown' });
+    if (loadingMsg && loadingMsg.message_id) {
+      await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+    }
+    await safeReply(ctx, `❌ *Failed to access MEGA link:* ${escapeMarkdownV2(err.message)}\nEnsure the link is public and valid\\.`);
   }
 });
 
@@ -736,10 +836,10 @@ bot.on('callback_query', async (ctx) => {
   const data = ctx.callbackQuery.data;
 
   try {
-    await ctx.answerCbQuery();
+    await ctx.answerCbQuery().catch(() => {});
 
     if (!session.megaNode) {
-      return ctx.reply('⚠️ *Session expired or lost.* Please send the MEGA link again.', { parse_mode: 'Markdown' });
+      return safeReply(ctx, '⚠️ *Session expired or lost\\.* Please send the MEGA link again\\.');
     }
 
     const currentDir = getCurrentDirectoryNode(session);
@@ -794,7 +894,7 @@ bot.on('callback_query', async (ctx) => {
     // 4. CANCEL SESSION
     if (data === 'act:cancel') {
       await resetSession(ctx.chat.id);
-      return ctx.editMessageText('❌ *Session closed and cleared.*', { parse_mode: 'Markdown' });
+      return safeEditMessageText(ctx, '❌ *Session closed and cleared\\.*');
     }
 
     // 5. DOWNLOAD INITIATION
@@ -810,11 +910,11 @@ bot.on('callback_query', async (ctx) => {
       }
 
       if (filesToDownload.length === 0) {
-        return ctx.reply('⚠️ No files found for download.', { parse_mode: 'Markdown' });
+        return safeReply(ctx, '⚠️ No files found for download\\.');
       }
 
       if (session.activeJob) {
-        return ctx.reply('⚠️ You already have an active job running. Wait for it or send /cancel.', { parse_mode: 'Markdown' });
+        return safeReply(ctx, '⚠️ You already have an active job running\\. Wait for it or send /cancel\\.');
       }
 
       // Create new job
@@ -836,7 +936,7 @@ bot.on('callback_query', async (ctx) => {
       session.activeJob = job;
 
       globalQueue.push(job);
-      await ctx.reply(`📋 *Job added to queue.* Position in queue: ${globalQueue.length}\nFiles: ${filesToDownload.length}`, { parse_mode: 'Markdown' });
+      await safeReply(ctx, `📋 *Job added to queue\\.* Position in queue: ${globalQueue.length}\nFiles: ${filesToDownload.length}`);
 
       processNextQueue();
     }
