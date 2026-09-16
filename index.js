@@ -2,7 +2,7 @@ const path = require('path');
 const fs = require('fs-extra');
 const crypto = require('crypto');
 const { Telegraf, Markup } = require('telegraf');
-const { File: MegaFile, Folder: MegaFolder } = require('megajs');
+const { File: MegaFile } = require('megajs');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const sharp = require('sharp');
@@ -36,7 +36,7 @@ const userSessions = new Map(); // chatId -> Session State
 const globalQueue = [];
 let activeJobsCount = 0;
 
-// Helper: Generate safe ID
+// Helper: Generate safe fallback ID
 const generateId = () => crypto.randomBytes(6).toString('hex');
 
 // Format bytes into readable format
@@ -89,6 +89,18 @@ async function cleanupFile(filePath) {
     }
   } catch (err) {
     console.error(`[CLEANUP ERROR] Failed to delete ${filePath}:`, err.message);
+  }
+}
+
+// Validate MEGA Link Format
+function isValidMegaUrl(urlStr) {
+  try {
+    const parsed = new URL(urlStr);
+    const host = parsed.hostname.toLowerCase();
+    if (!host.endsWith('mega.nz') && !host.endsWith('mega.co.nz')) return false;
+    return true;
+  } catch (e) {
+    return false;
   }
 }
 
@@ -154,22 +166,55 @@ function collectFilesRecursively(node, fileList = []) {
   return fileList;
 }
 
-// Map tree for UI representation
+// Map real megajs tree for UI representation
 function mapMegaTree(node) {
   if (!node) return null;
+
+  const isDirectory = !!node.directory;
+  const nodeId = node.handle || node.downloadId || generateId();
+
   const item = {
-    id: node.id || generateId(),
-    name: node.name || 'Root',
+    id: nodeId,
+    name: node.name || (isDirectory ? 'Root Folder' : 'Unnamed File'),
     size: node.size || 0,
-    directory: !!node.directory,
+    directory: isDirectory,
     rawNode: node,
     children: []
   };
 
-  if (node.directory && node.children) {
-    item.children = node.children.map(child => mapMegaTree(child));
+  if (isDirectory && Array.isArray(node.children)) {
+    item.children = node.children.map(child => mapMegaTree(child)).filter(Boolean);
   }
+
   return item;
+}
+
+// Load attributes and structure from megajs node
+async function loadMegaStructure(urlStr) {
+  const node = MegaFile.fromURL(urlStr);
+
+  await new Promise((resolve, reject) => {
+    node.loadAttributes((err, loaded) => {
+      if (err) return reject(err);
+      resolve(loaded || node);
+    });
+  });
+
+  const mapped = mapMegaTree(node);
+
+  // Single file fallback: wrap standalone file node into root container for browser UI consistency
+  if (!mapped.directory) {
+    return {
+      id: 'root_container',
+      name: 'Root Folder',
+      size: 0,
+      directory: true,
+      rawNode: null,
+      children: [mapped]
+    };
+  }
+
+  return mapped;
 }
 
 // ==========================================
@@ -183,6 +228,7 @@ function buildBrowserUI(session) {
   let text = `📁 *MEGA File Browser*\n📍 *Path:* \`${titlePath}\`\n\n`;
 
   const items = currentNode.children || [];
+
   const totalPages = Math.ceil(items.length / ITEMS_PER_PAGE) || 1;
   session.currentPage = Math.max(0, Math.min(session.currentPage, totalPages - 1));
 
@@ -200,7 +246,7 @@ function buildBrowserUI(session) {
       const selectMark = isSelected ? '☑️ ' : item.directory ? '' : '☐ ';
       const label = `${selectMark}${icon} ${item.name}` + (item.directory ? '' : ` (${formatBytes(item.size)})`);
 
-      // Callback payload format: action:nodeId
+      // Callback payload format: nav:nodeId
       keyboard.push([Markup.button.callback(label.substring(0, 40), `nav:${item.id}`)]);
     });
   }
@@ -221,7 +267,10 @@ function buildBrowserUI(session) {
   const dlRow = [];
   if (currentNode.directory) {
     dlRow.push(Markup.button.callback('📥 Download Folder', 'dl:curr'));
+  } else {
+    dlRow.push(Markup.button.callback('📥 Download File', 'dl:curr'));
   }
+
   if (session.selectedFiles.size > 0) {
     dlRow.push(Markup.button.callback(`✅ Download Selected (${session.selectedFiles.size})`, 'dl:sel'));
   }
@@ -659,8 +708,8 @@ bot.command('cancel', async (ctx) => {
 bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
 
-  // Validate MEGA link regex
-  if (!text.includes('mega.nz')) {
+  // Validate MEGA link URL format
+  if (!isValidMegaUrl(text)) {
     return ctx.reply('⚠️ Please send a valid MEGA.nz link (e.g., `https://mega.nz/folder/...` or `https://mega.nz/file/...`)', { parse_mode: 'Markdown' });
   }
 
@@ -668,15 +717,7 @@ bot.on('text', async (ctx) => {
   const loadingMsg = await ctx.reply('🔍 *Inspecting MEGA link and loading structure...*', { parse_mode: 'Markdown' });
 
   try {
-    const node = File.fromURL(text);
-    await new Promise((resolve, reject) => {
-      node.loadAttributes((err, loadedNode) => {
-        if (err) return reject(err);
-        resolve(loadedNode);
-      });
-    });
-
-    session.megaNode = mapMegaTree(node);
+    session.megaNode = await loadMegaStructure(text);
     await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
     await renderOrUpdateBrowser(ctx, session);
 
