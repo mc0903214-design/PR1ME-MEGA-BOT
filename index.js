@@ -1,76 +1,68 @@
-const path = require('path');
-const fs = require('fs-extra');
-const os = require('os');
-const crypto = require('crypto');
-
 const { Telegraf, Markup } = require('telegraf');
 const { File: MegaFile } = require('megajs');
+const fs = require('fs-extra');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const mime = require('mime-types');
 
 // ============================================================
-// CONFIGURATION
+// CONFIG
 // ============================================================
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
 if (!BOT_TOKEN) {
-  console.error('[CRITICAL] BOT_TOKEN environment variable is missing.');
-  process.exit(1);
+  throw new Error('BOT_TOKEN environment variable is required.');
 }
-
-const bot = new Telegraf(BOT_TOKEN);
 
 const TEMP_DIR = path.join(
   os.tmpdir(),
   'telegram-mega-downloader'
 );
 
+const ITEMS_PER_PAGE = 8;
+const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+const PROGRESS_EDIT_INTERVAL_MS = 1500;
+const DOWNLOAD_PROGRESS_INTERVAL_MS = 2500;
+
 fs.ensureDirSync(TEMP_DIR);
 
-const ITEMS_PER_PAGE = 8;
+// ============================================================
+// BOT
+// ============================================================
 
-const SESSION_TIMEOUT_MS =
-  30 * 60 * 1000;
-
-const PROGRESS_EDIT_INTERVAL_MS =
-  1500;
-
-const DOWNLOAD_PROGRESS_INTERVAL_MS =
-  2500;
+const bot = new Telegraf(BOT_TOKEN);
 
 // ============================================================
 // SESSION STORAGE
 // ============================================================
 
-const userSessions = new Map();
+const sessions = new Map();
 
 class UserSession {
   constructor(userId) {
     this.userId = userId;
 
-    // MEGA state
+    // MEGA browser state
     this.rootNode = null;
     this.currentFolder = null;
-
-    // Navigation
     this.pathStack = [];
 
-    // Selected files
+    // Selected file IDs
     this.selectedIds = new Set();
 
     // Pagination
     this.page = 0;
 
-    // Active download
+    // Active download job
     this.activeJob = null;
 
     // Activity
     this.lastActivity = Date.now();
-
-    // Telegram progress editing
     this.lastMsgEditTime = 0;
 
-    // Used to prevent old requests from overwriting
-    // a newer MEGA link/session.
+    // Used to invalidate old async link-loading operations
     this.generation = 0;
   }
 
@@ -78,9 +70,35 @@ class UserSession {
     this.lastActivity = Date.now();
   }
 
-  newGeneration() {
+  invalidate() {
     this.generation++;
     return this.generation;
+  }
+
+  cancelActiveJob() {
+    if (!this.activeJob) {
+      return false;
+    }
+
+    this.activeJob.cancelled = true;
+
+    try {
+      if (this.activeJob.stream) {
+        this.activeJob.stream.destroy();
+      }
+    } catch (err) {
+      console.error('[CANCEL STREAM ERROR]', err);
+    }
+
+    try {
+      if (this.activeJob.writeStream) {
+        this.activeJob.writeStream.destroy();
+      }
+    } catch (err) {
+      console.error('[CANCEL WRITE STREAM ERROR]', err);
+    }
+
+    return true;
   }
 
   resetBrowser() {
@@ -89,60 +107,21 @@ class UserSession {
     this.pathStack = [];
     this.selectedIds.clear();
     this.page = 0;
-    this.lastMsgEditTime = 0;
-  }
-
-  cancelActiveJob() {
-    const job = this.activeJob;
-
-    if (!job) {
-      return false;
-    }
-
-    job.cancelled = true;
-
-    if (
-      job.stream &&
-      typeof job.stream.destroy === 'function'
-    ) {
-      try {
-        job.stream.destroy(
-          new Error('USER_CANCELLED')
-        );
-      } catch (_) {}
-    }
-
-    if (
-      job.writeStream &&
-      typeof job.writeStream.destroy === 'function'
-    ) {
-      try {
-        job.writeStream.destroy(
-          new Error('USER_CANCELLED')
-        );
-      } catch (_) {}
-    }
-
-    // Do NOT remove the temp file here.
-    // The download function will clean it after
-    // both streams have finished shutting down.
-
-    return true;
   }
 
   reset() {
+    this.invalidate();
     this.cancelActiveJob();
     this.resetBrowser();
-    this.newGeneration();
   }
 }
 
 function getSession(userId) {
-  let session = userSessions.get(userId);
+  let session = sessions.get(userId);
 
   if (!session) {
     session = new UserSession(userId);
-    userSessions.set(userId, session);
+    sessions.set(userId, session);
   }
 
   session.touch();
@@ -151,83 +130,52 @@ function getSession(userId) {
 }
 
 // ============================================================
-// SESSION GARBAGE COLLECTION
+// SESSION CLEANUP
 // ============================================================
 
 setInterval(() => {
   const now = Date.now();
 
-  for (
-    const [userId, session]
-    of userSessions.entries()
-  ) {
+  for (const [userId, session] of sessions.entries()) {
     if (
-      now - session.lastActivity >
-        SESSION_TIMEOUT_MS &&
-      !session.activeJob
+      !session.activeJob &&
+      now - session.lastActivity > SESSION_TIMEOUT_MS
     ) {
-      userSessions.delete(userId);
+      sessions.delete(userId);
     }
   }
 }, 5 * 60 * 1000);
 
 // ============================================================
-// GENERAL HELPERS
+// HELPERS
 // ============================================================
 
-function sanitizeFilename(filename) {
-  if (!filename) {
-    return 'unnamed_file';
+function sanitizeFilename(name) {
+  let safe = String(name || 'file');
+
+  safe = safe
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!safe) {
+    safe = 'file';
   }
 
-  let safe = String(filename);
-
-  safe = path.basename(safe);
-
-  safe = safe.replace(
-    /[\/\\?%*:|"<>]/g,
-    '_'
-  );
-
-  safe = safe.replace(
-    /[\x00-\x1F\x7F]/g,
-    '_'
-  );
-
-  safe = safe.replace(
-    /\s+/g,
-    ' '
-  ).trim();
-
-  if (
-    !safe ||
-    safe === '.' ||
-    safe === '..'
-  ) {
-    return 'unnamed_file';
+  // Avoid excessively long filesystem names.
+  if (safe.length > 180) {
+    safe = safe.slice(0, 180);
   }
 
   return safe;
 }
 
-function truncateText(text, maxLength = 40) {
-  const value = String(text || '');
-
-  if (value.length <= maxLength) {
-    return value;
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return 'Unknown size';
   }
 
-  return (
-    value.slice(0, Math.max(1, maxLength - 3)) +
-    '...'
-  );
-}
-
-function formatBytes(bytes) {
-  if (
-    !Number.isFinite(bytes) ||
-    bytes <= 0
-  ) {
+  if (bytes === 0) {
     return '0 B';
   }
 
@@ -236,25 +184,17 @@ function formatBytes(bytes) {
     'KB',
     'MB',
     'GB',
-    'TB',
-    'PB'
+    'TB'
   ];
 
-  const i = Math.min(
-    Math.floor(
-      Math.log(bytes) /
-      Math.log(1024)
-    ),
+  const index = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
     units.length - 1
   );
 
-  const value =
-    bytes /
-    Math.pow(1024, i);
+  const value = bytes / Math.pow(1024, index);
 
-  return (
-    `${parseFloat(value.toFixed(2))} ${units[i]}`
-  );
+  return `${value.toFixed(index === 0 ? 0 : 2)} ${units[index]}`;
 }
 
 function getNodeId(node) {
@@ -270,33 +210,60 @@ function getNodeId(node) {
   );
 }
 
-function isDirectory(node) {
-  return !!(
-    node &&
-    node.directory === true
+function getNodeName(node) {
+  if (!node) {
+    return 'Unknown';
+  }
+
+  return (
+    node.name ||
+    node.attributes?.name ||
+    node.label ||
+    'Unnamed'
   );
 }
 
-function getNodeName(node) {
+function isDirectory(node) {
   if (!node) {
-    return 'Unnamed';
+    return false;
   }
 
-  return node.name || 'Unnamed';
+  if (node.directory === true) {
+    return true;
+  }
+
+  if (node.type === 1) {
+    return true;
+  }
+
+  if (node.type === 'folder') {
+    return true;
+  }
+
+  if (Array.isArray(node.children)) {
+    return true;
+  }
+
+  return false;
+}
+
+function getChildren(folder) {
+  if (!folder || !isDirectory(folder)) {
+    return [];
+  }
+
+  return Array.isArray(folder.children)
+    ? folder.children
+    : [];
 }
 
 function makeTempFilePath(filename) {
-  const safeName =
-    sanitizeFilename(filename);
-
-  const uniqueId =
-    crypto
-      .randomBytes(8)
-      .toString('hex');
+  const id = crypto.randomBytes(12).toString('hex');
+  const safeName = sanitizeFilename(filename);
 
   return path.join(
     TEMP_DIR,
-    `${Date.now()}_${uniqueId}_${safeName}`
+    `${Date.now()}-${id}-${safeName}`
   );
 }
 
@@ -307,197 +274,141 @@ async function cleanupTempFile(filePath) {
 
   try {
     await fs.remove(filePath);
-
-    console.log(
-      `[CLEANUP] Removed: ${filePath}`
-    );
   } catch (err) {
     console.error(
-      `[CLEANUP ERROR] ${filePath}`,
+      '[TEMP CLEANUP ERROR]',
+      filePath,
       err.message
     );
   }
 }
 
 function cleanErrorMessage(error) {
-  let message =
-    error &&
-    error.message
-      ? String(error.message)
-      : 'Unknown error';
+  if (!error) {
+    return 'Unknown error.';
+  }
 
-  message =
-    message
-      .replace(/\s+/g, ' ')
-      .trim();
+  let message = error.message || String(error);
 
-  if (message.length > 250) {
-    message =
-      message.slice(0, 247) +
-      '...';
+  message = message
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (message.length > 500) {
+    message = message.slice(0, 500) + '...';
   }
 
   return message;
+}
+
+function escapeHtml(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function truncate(text, maxLength = 55) {
+  const value = String(text || '');
+
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return value.slice(0, maxLength - 3) + '...';
 }
 
 // ============================================================
 // MEGA URL PARSING
 // ============================================================
 
-function parseMegaUrl(input) {
-  if (!input) {
-    return null;
-  }
+function parseMegaUrl(url) {
+  const value = String(url || '').trim();
 
-  const rawUrl =
-    String(input).trim();
+  // Modern file:
+  // https://mega.nz/file/ID#KEY
+  const modernFile = value.match(
+    /mega(?:\.nz|\.co\.nz)\/file\/([^#/?]+)#([^/?\s]+)/i
+  );
 
-  if (!rawUrl) {
-    return null;
-  }
-
-  let url;
-
-  try {
-    url = new URL(rawUrl);
-  } catch (_) {
-    return null;
-  }
-
-  const hostname =
-    url.hostname.toLowerCase();
-
-  if (
-    hostname !== 'mega.nz' &&
-    hostname !== 'mega.co.nz' &&
-    hostname !== 'www.mega.nz' &&
-    hostname !== 'www.mega.co.nz'
-  ) {
-    return null;
-  }
-
-  const pathname =
-    url.pathname;
-
-  // ----------------------------------------------------------
-  // MODERN FILE
-  // https://mega.nz/file/FILE_ID#KEY
-  // ----------------------------------------------------------
-
-  const modernFileMatch =
-    pathname.match(
-      /^\/file\/([^/]+)$/i
-    );
-
-  if (modernFileMatch) {
+  if (modernFile) {
     return {
       type: 'file',
-      rawUrl,
-      fileId: modernFileMatch[1],
-      key: url.hash
-        ? url.hash.slice(1).split('/')[0]
-        : null
+      rootId: modernFile[1],
+      key: modernFile[2],
+      targetId: modernFile[1]
     };
   }
 
-  // ----------------------------------------------------------
-  // MODERN FOLDER
-  //
-  // https://mega.nz/folder/ROOT_ID#KEY
-  // https://mega.nz/folder/ROOT_ID#KEY/folder/SUB_ID
-  // https://mega.nz/folder/ROOT_ID#KEY/file/FILE_ID
-  // ----------------------------------------------------------
+  // Modern folder:
+  // https://mega.nz/folder/ROOT#KEY
+  // https://mega.nz/folder/ROOT#KEY/folder/SUB
+  // https://mega.nz/folder/ROOT#KEY/file/SUB
+  const modernFolder = value.match(
+    /mega(?:\.nz|\.co\.nz)\/folder\/([^#/?]+)#([^/?\s]+)(.*)?/i
+  );
 
-  const folderMatch =
-    pathname.match(
-      /^\/folder\/([^/]+)(?:\/(folder|file)\/([^/]+))?$/i
+  if (modernFolder) {
+    const rootId = modernFolder[1];
+    const key = modernFolder[2];
+    const remainder = modernFolder[3] || '';
+
+    const targetFolder = remainder.match(
+      /\/folder\/([^/?#]+)/i
     );
 
-  if (folderMatch) {
-    const hashValue =
-      url.hash
-        ? url.hash.slice(1)
-        : '';
-
-    const key =
-      hashValue
-        ? hashValue.split('/')[0]
-        : null;
+    const targetFile = remainder.match(
+      /\/file\/([^/?#]+)/i
+    );
 
     return {
-      type: 'folder',
-      rawUrl,
-      rootId: folderMatch[1],
+      type: targetFile ? 'file' : 'folder',
+      rootId,
       key,
-      targetType:
-        folderMatch[2]
-          ? folderMatch[2].toLowerCase()
-          : null,
       targetId:
-        folderMatch[3] || null
+        targetFile?.[1] ||
+        targetFolder?.[1] ||
+        rootId
     };
   }
 
-  // ----------------------------------------------------------
-  // LEGACY FILE
-  // https://mega.nz/#!FILE_ID!KEY
-  // ----------------------------------------------------------
+  // Legacy file:
+  // https://mega.nz/#!ID!KEY
+  const legacyFile = value.match(
+    /mega(?:\.nz|\.co\.nz)\/#!([^!/?]+)!([^/?\s]+)/i
+  );
 
-  const hash =
-    url.hash || '';
-
-  const legacyFileMatch =
-    hash.match(
-      /^#!([^!]+)!([^/]+)$/i
-    );
-
-  if (legacyFileMatch) {
+  if (legacyFile) {
     return {
       type: 'file',
-      rawUrl,
-      fileId: legacyFileMatch[1],
-      key: legacyFileMatch[2]
+      rootId: legacyFile[1],
+      key: legacyFile[2],
+      targetId: legacyFile[1]
     };
   }
 
-  // ----------------------------------------------------------
-  // LEGACY FOLDER
-  // https://mega.nz/#F!ROOT_ID!KEY
-  // ----------------------------------------------------------
+  // Legacy folder:
+  // https://mega.nz/#F!ID!KEY
+  const legacyFolder = value.match(
+    /mega(?:\.nz|\.co\.nz)\/#F!([^!/?]+)!([^/?\s]+)/i
+  );
 
-  const legacyFolderMatch =
-    hash.match(
-      /^#F!([^!]+)!([^/]+)$/i
-    );
-
-  if (legacyFolderMatch) {
+  if (legacyFolder) {
     return {
       type: 'folder',
-      rawUrl,
-      rootId: legacyFolderMatch[1],
-      key: legacyFolderMatch[2],
-      targetType: null,
-      targetId: null
+      rootId: legacyFolder[1],
+      key: legacyFolder[2],
+      targetId: legacyFolder[1]
     };
   }
 
-  // ----------------------------------------------------------
-  // UNKNOWN MEGA URL
-  // ----------------------------------------------------------
-
-  if (
-    hostname === 'mega.nz' ||
-    hostname === 'mega.co.nz' ||
-    hostname === 'www.mega.nz' ||
-    hostname === 'www.mega.co.nz'
-  ) {
-    return {
-      type: 'unknown',
-      rawUrl
-    };
-  }
-
-  return null;
+  return {
+    type: 'unknown',
+    rootId: null,
+    key: null,
+    targetId: null
+  };
 }
 
 // ============================================================
@@ -505,146 +416,79 @@ function parseMegaUrl(input) {
 // ============================================================
 
 async function loadMegaNode(url) {
-  const node =
-    MegaFile.fromURL(url);
+  const node = MegaFile.fromURL(url);
 
-  /*
-   * IMPORTANT:
-   * MEGAJS loadAttributes() returns the selected node
-   * for links such as /folder/.../file/...
-   *
-   * We return BOTH:
-   * - mainNode = original File.fromURL object
-   * - selectedNode = result of loadAttributes()
-   */
+  await node.loadAttributes();
 
-  const selectedNode =
-    await node.loadAttributes();
-
-  return {
-    mainNode: node,
-    selectedNode:
-      selectedNode || node
-  };
+  return node;
 }
 
-async function ensureFolderLoaded(folder) {
-  if (!folder) {
-    throw new Error(
-      'Folder object is missing.'
-    );
-  }
+async function loadMegaFolder(url) {
+  const folder = MegaFile.fromURL(url);
+
+  await folder.loadAttributes();
 
   if (!isDirectory(folder)) {
     throw new Error(
-      'The selected MEGA item is not a folder.'
+      'The supplied MEGA link is not a folder.'
     );
   }
 
-  /*
-   * Some folder nodes obtained from another folder
-   * may not have their children populated yet.
-   *
-   * Explicitly load the folder before trying to display
-   * or navigate inside it.
-   */
+  await ensureFolderLoaded(folder);
+
+  return folder;
+}
+
+/**
+ * Important:
+ * Some MEGAJS node objects don't have their children populated
+ * until their attributes are loaded.
+ */
+async function ensureFolderLoaded(folder) {
+  if (!folder || !isDirectory(folder)) {
+    throw new Error('The selected MEGA item is not a folder.');
+  }
 
   if (!Array.isArray(folder.children)) {
-    console.log(
-      `[MEGA] Loading children for folder: ${getNodeName(folder)}`
-    );
-
     await folder.loadAttributes();
   }
 
   if (!Array.isArray(folder.children)) {
     throw new Error(
-      `MEGA could not load the contents of folder "${getNodeName(folder)}".`
+      'MEGA folder contents could not be loaded.'
     );
   }
 
   return folder;
 }
 
-async function loadMegaFolder(url) {
-  const {
-    mainNode,
-    selectedNode
-  } =
-    await loadMegaNode(url);
-
-  const folder =
-    selectedNode &&
-    isDirectory(selectedNode)
-      ? selectedNode
-      : mainNode;
-
-  await ensureFolderLoaded(
-    folder
-  );
-
-  return folder;
-}
-
 // ============================================================
-// FOLDER TREE HELPERS
+// ASYNC TREE SEARCH
 // ============================================================
 
-function getChildren(folder) {
-  if (
-    !folder ||
-    !isDirectory(folder)
-  ) {
-    return [];
-  }
-
-  return Array.isArray(folder.children)
-    ? folder.children
-    : [];
-}
-
-function findNodeById(root, targetId) {
-  if (
-    !root ||
-    !targetId
-  ) {
+async function findNodeByIdAsync(folder, targetId) {
+  if (!folder || !targetId) {
     return null;
   }
 
-  const rootId =
-    getNodeId(root);
+  await ensureFolderLoaded(folder);
 
-  if (
-    rootId &&
-    rootId === targetId
-  ) {
-    return root;
-  }
+  const children = getChildren(folder);
 
-  const children =
-    getChildren(root);
+  for (const child of children) {
+    const childId = getNodeId(child);
 
-  for (
-    const child of children
-  ) {
-    const childId =
-      getNodeId(child);
-
-    if (
-      childId &&
-      childId === targetId
-    ) {
+    if (childId === targetId) {
       return child;
     }
+  }
 
-    if (
-      isDirectory(child)
-    ) {
-      const found =
-        findNodeById(
-          child,
-          targetId
-        );
+  for (const child of children) {
+    if (isDirectory(child)) {
+      const found = await findNodeByIdAsync(
+        child,
+        targetId
+      );
 
       if (found) {
         return found;
@@ -655,962 +499,299 @@ function findNodeById(root, targetId) {
   return null;
 }
 
-function buildPathToNode(
-  root,
-  target
-) {
-  if (
-    !root ||
-    !target ||
-    root === target
-  ) {
-    return [];
-  }
-
-  const targetId =
-    getNodeId(target);
-
-  function search(
-    current,
-    parents
-  ) {
-    if (!current) {
-      return null;
-    }
-
-    const currentId =
-      getNodeId(current);
-
-    if (
-      current === target ||
-      (
-        targetId &&
-        currentId === targetId
-      )
-    ) {
-      return parents;
-    }
-
-    for (
-      const child of
-      getChildren(current)
-    ) {
-      if (
-        !isDirectory(child)
-      ) {
-        continue;
-      }
-
-      const result =
-        search(
-          child,
-          [
-            ...parents,
-            {
-              id: getNodeId(current),
-              name: getNodeName(current),
-              node: current
-            }
-          ]
-        );
-
-      if (result) {
-        return result;
-      }
-    }
-
+async function buildPathToNodeAsync(folder, targetId) {
+  if (!folder || !targetId) {
     return null;
   }
 
-  return (
-    search(root, []) ||
-    []
-  );
-}
+  const folderId = getNodeId(folder);
 
-function collectAllFilesSync(
-  root
-) {
-  if (!root) {
+  if (folderId === targetId) {
     return [];
   }
 
-  const result = [];
-  const stack = [root];
+  await ensureFolderLoaded(folder);
 
-  while (stack.length > 0) {
-    const current =
-      stack.pop();
+  const children = getChildren(folder);
 
-    if (!current) {
+  for (const child of children) {
+    if (getNodeId(child) === targetId) {
+      return [child];
+    }
+  }
+
+  for (const child of children) {
+    if (!isDirectory(child)) {
       continue;
     }
 
-    if (!isDirectory(current)) {
-      result.push(current);
-      continue;
-    }
+    const result = await buildPathToNodeAsync(
+      child,
+      targetId
+    );
 
-    const children =
-      getChildren(current);
-
-    for (
-      let i = children.length - 1;
-      i >= 0;
-      i--
-    ) {
-      stack.push(
-        children[i]
-      );
+    if (result) {
+      return [child, ...result];
     }
   }
 
-  return result;
+  return null;
 }
 
 // ============================================================
-// TELEGRAM MESSAGE HELPERS
+// RECURSIVE FILE COLLECTION
 // ============================================================
 
-async function safeEditMessage(
-  ctx,
-  text,
-  extra = {}
-) {
-  try {
-    if (
-      ctx.callbackQuery &&
-      ctx.callbackQuery.message
-    ) {
-      await ctx.telegram.editMessageText(
-        ctx.callbackQuery.message.chat.id,
-        ctx.callbackQuery.message.message_id,
-        undefined,
-        text,
-        extra
-      );
-
-      return;
-    }
-
-    await ctx.reply(
-      text,
-      extra
-    );
-  } catch (err) {
-    if (
-      !String(
-        err.description || ''
-      ).toLowerCase()
-      .includes(
-        'message is not modified'
-      )
-    ) {
-      console.error(
-        '[MESSAGE EDIT ERROR]',
-        err.message
-      );
-    }
+async function collectAllFiles(node, output = []) {
+  if (!node) {
+    return output;
   }
+
+  if (!isDirectory(node)) {
+    output.push(node);
+    return output;
+  }
+
+  await ensureFolderLoaded(node);
+
+  const children = getChildren(node);
+
+  for (const child of children) {
+    await collectAllFiles(child, output);
+  }
+
+  return output;
 }
 
 // ============================================================
-// START
+// TELEGRAM TEXT
 // ============================================================
 
-bot.start(
-  async ctx => {
-    const session =
-      getSession(ctx.from.id);
+function getStartText() {
+  return [
+    '📥 MEGA DOWNLOADER',
+    '',
+    'Send me a public MEGA file or folder link.',
+    '',
+    'I can:',
+    '• Browse folders',
+    '• Open nested folders',
+    '• Select individual files',
+    '• Download multiple files',
+    '• Download an entire folder',
+    '• Download the complete MEGA folder',
+    '',
+    'Use /help for more information.'
+  ].join('\n');
+}
 
-    session.reset();
-
-    await ctx.reply(
-      [
-        '🤖 MEGA Downloader Bot',
-        '',
-        'Send me a public MEGA file or folder link.',
-        '',
-        'You can:',
-        '• Browse folders',
-        '• Open nested folders',
-        '• Select individual files',
-        '• Download selected files',
-        '• Download an entire folder',
-        '• Download everything',
-        '• Cancel active downloads',
-        '',
-        'Commands:',
-        '/cancel - Cancel download or clear session',
-        '/help - Show help'
-      ].join('\n')
-    );
-  }
-);
-
-// ============================================================
-// HELP
-// ============================================================
-
-bot.help(
-  async ctx => {
-    await ctx.reply(
-      [
-        'ℹ️ MEGA Downloader Help',
-        '',
-        '1. Send a public MEGA file or folder link.',
-        '2. Browse the folder using the buttons.',
-        '3. Tap files to select them.',
-        '4. Choose Download Selected, Download All, or Download This Folder.',
-        '',
-        'Files are downloaded from MEGA to temporary storage and then uploaded to Telegram.',
-        '',
-        'Use /cancel at any time to cancel an active download.'
-      ].join('\n')
-    );
-  }
-);
+function getHelpText() {
+  return [
+    '📚 MEGA DOWNLOADER HELP',
+    '',
+    '1. Send a public MEGA link.',
+    '2. If it is a folder, browse its contents.',
+    '3. Select the files you want.',
+    '4. Press Download Selected.',
+    '',
+    'Other options:',
+    '• Download All',
+    '• Download This Folder',
+    '• Select All Here',
+    '• Back',
+    '• Root',
+    '• Cancel',
+    '',
+    'Use /cancel at any time to stop an active download.'
+  ].join('\n');
+}
 
 // ============================================================
-// CANCEL COMMAND
+// UI
 // ============================================================
 
-bot.command(
-  'cancel',
-  async ctx => {
-    const session =
-      getSession(ctx.from.id);
+async function renderBrowserUI(ctx) {
+  const session = getSession(ctx.from.id);
 
-    if (
-      session.activeJob
-    ) {
-      session.cancelActiveJob();
+  const folder = session.currentFolder;
 
-      await ctx.reply(
-        '❌ Current download task has been cancelled.'
-      );
-
-      return;
-    }
-
-    session.reset();
-
-    await ctx.reply(
-      '❌ Current MEGA browsing session has been cleared.'
-    );
-  }
-);
-
-// ============================================================
-// MAIN MEGA LINK HANDLER
-// ============================================================
-
-bot.on(
-  'text',
-  async (ctx, next) => {
-    const text =
-      ctx.message.text.trim();
-
-    if (
-      !text ||
-      text.startsWith('/')
-    ) {
-      return next();
-    }
-
-    const parsed =
-      parseMegaUrl(text);
-
-    if (!parsed) {
-      return next();
-    }
-
-    const session =
-      getSession(ctx.from.id);
-
-    /*
-     * Every new link gets a new generation.
-     *
-     * If the user sends another link while this one
-     * is still loading, the old request will not be
-     * allowed to overwrite the newer session.
-     */
-
-    session.cancelActiveJob();
-
-    session.resetBrowser();
-
-    const generation =
-      session.newGeneration();
-
-    const statusMsg =
-      await ctx.reply(
-        '🔎 Checking MEGA link...'
-      );
-
-    try {
-      console.log(
-        `[MEGA] Incoming URL: ${parsed.rawUrl}`
-      );
-
-      // ======================================================
-      // DIRECT FILE LINK
-      // ======================================================
-
-      if (
-        parsed.type === 'file'
-      ) {
-        const {
-          mainNode,
-          selectedNode
-        } =
-          await loadMegaNode(
-            parsed.rawUrl
-          );
-
-        if (
-          generation !==
-          session.generation
-        ) {
-          return;
-        }
-
-        const actualFile =
-          selectedNode &&
-          !isDirectory(selectedNode)
-            ? selectedNode
-            : mainNode &&
-              !isDirectory(mainNode)
-              ? mainNode
-              : null;
-
-        if (!actualFile) {
-          throw new Error(
-            'The MEGA link did not resolve to a downloadable file.'
-          );
-        }
-
-        session.rootNode =
-          actualFile;
-
-        session.currentFolder =
-          null;
-
-        session.pathStack =
-          [];
-
-        session.selectedIds.clear();
-
-        const filename =
-          getNodeName(
-            actualFile
-          );
-
-        const keyboard =
-          Markup.inlineKeyboard([
-            [
-              Markup.button.callback(
-                '⬇️ Download',
-                'dl_single_file'
-              )
-            ],
-            [
-              Markup.button.callback(
-                '❌ Cancel',
-                'cancel_session'
-              )
-            ]
-          ]);
-
-        await ctx.telegram.editMessageText(
-          statusMsg.chat.id,
-          statusMsg.message_id,
-          undefined,
-          [
-            '✅ File found',
-            '',
-            `📄 ${filename}`,
-            `📦 Size: ${formatBytes(actualFile.size)}`
-          ].join('\n'),
-          keyboard
-        );
-
-        return;
-      }
-
-      // ======================================================
-      // FOLDER LINK
-      // ======================================================
-
-      let rootFolder;
-
-      if (
-        parsed.type === 'folder'
-      ) {
-        let rootUrl;
-
-        if (
-          parsed.rootId &&
-          parsed.key
-        ) {
-          rootUrl =
-            `https://mega.nz/folder/${parsed.rootId}#${parsed.key}`;
-        } else {
-          rootUrl =
-            parsed.rawUrl;
-        }
-
-        console.log(
-          `[MEGA] Loading root folder: ${rootUrl}`
-        );
-
-        rootFolder =
-          await loadMegaFolder(
-            rootUrl
-          );
-      } else {
-        const {
-          mainNode,
-          selectedNode
-        } =
-          await loadMegaNode(
-            parsed.rawUrl
-          );
-
-        const actual =
-          selectedNode ||
-          mainNode;
-
-        if (!actual) {
-          throw new Error(
-            'Unable to resolve MEGA link.'
-          );
-        }
-
-        if (
-          !isDirectory(actual)
-        ) {
-          session.rootNode =
-            actual;
-
-          await ctx.telegram.editMessageText(
-            statusMsg.chat.id,
-            statusMsg.message_id,
-            undefined,
-            [
-              '✅ File found',
-              '',
-              `📄 ${getNodeName(actual)}`,
-              `📦 Size: ${formatBytes(actual.size)}`
-            ].join('\n'),
-            Markup.inlineKeyboard([
-              [
-                Markup.button.callback(
-                  '⬇️ Download',
-                  'dl_single_file'
-                )
-              ],
-              [
-                Markup.button.callback(
-                  '❌ Cancel',
-                  'cancel_session'
-                )
-              ]
-            ])
-          );
-
-          return;
-        }
-
-        rootFolder =
-          actual;
-
-        await ensureFolderLoaded(
-          rootFolder
-        );
-      }
-
-      if (
-        generation !==
-        session.generation
-      ) {
-        return;
-      }
-
-      // ======================================================
-      // ROOT
-      // ======================================================
-
-      session.rootNode =
-        rootFolder;
-
-      let targetFolder =
-        rootFolder;
-
-      // ======================================================
-      // DIRECT TARGET FILE
-      //
-      // MEGAJS officially returns the selected file from
-      // loadAttributes() for /file/... links.
-      // We therefore try that FIRST.
-      // ======================================================
-
-      if (
-        parsed.targetType === 'file' &&
-        parsed.targetId
-      ) {
-        console.log(
-          `[MEGA] Resolving target file: ${parsed.targetId}`
-        );
-
-        const targetUrl =
-          parsed.rawUrl;
-
-        const {
-          mainNode,
-          selectedNode
-        } =
-          await loadMegaNode(
-            targetUrl
-          );
-
-        if (
-          generation !==
-          session.generation
-        ) {
-          return;
-        }
-
-        const targetFile =
-          selectedNode &&
-          !isDirectory(selectedNode)
-            ? selectedNode
-            : mainNode &&
-              !isDirectory(mainNode)
-              ? mainNode
-              : findNodeById(
-                  rootFolder,
-                  parsed.targetId
-                );
-
-        if (!targetFile) {
-          throw new Error(
-            `The requested MEGA file (${parsed.targetId}) could not be resolved.`
-          );
-        }
-
-        session.currentFolder =
-          null;
-
-        session.pathStack =
-          [];
-
-        session.selectedIds.clear();
-
-        session.rootNode =
-          targetFile;
-
-        await ctx.telegram.editMessageText(
-          statusMsg.chat.id,
-          statusMsg.message_id,
-          undefined,
-          [
-            '✅ File found',
-            '',
-            `📄 ${getNodeName(targetFile)}`,
-            `📦 Size: ${formatBytes(targetFile.size)}`
-          ].join('\n'),
-          Markup.inlineKeyboard([
-            [
-              Markup.button.callback(
-                '⬇️ Download',
-                'dl_single_file'
-              )
-            ],
-            [
-              Markup.button.callback(
-                '❌ Cancel',
-                'cancel_session'
-              )
-            ]
-          ])
-        );
-
-        return;
-      }
-
-      // ======================================================
-      // TARGET FOLDER
-      // ======================================================
-
-      if (
-        parsed.targetType === 'folder' &&
-        parsed.targetId
-      ) {
-        console.log(
-          `[MEGA] Searching for target folder: ${parsed.targetId}`
-        );
-
-        const found =
-          findNodeById(
-            rootFolder,
-            parsed.targetId
-          );
-
-        if (!found) {
-          throw new Error(
-            `The requested MEGA subfolder (${parsed.targetId}) could not be found.`
-          );
-        }
-
-        if (
-          !isDirectory(found)
-        ) {
-          throw new Error(
-            'The requested target is not a folder.'
-          );
-        }
-
-        // IMPORTANT:
-        // Explicitly load the nested folder before
-        // trying to display its contents.
-        targetFolder =
-          await ensureFolderLoaded(
-            found
-          );
-
-        session.pathStack =
-          buildPathToNode(
-            rootFolder,
-            targetFolder
-          );
-      } else {
-        session.pathStack =
-          [];
-      }
-
-      if (
-        generation !==
-        session.generation
-      ) {
-        return;
-      }
-
-      session.currentFolder =
-        targetFolder;
-
-      session.page = 0;
-
-      session.selectedIds.clear();
-
-      await renderBrowserUI(
-        ctx,
-        statusMsg.message_id
-      );
-
-    } catch (err) {
-      console.error(
-        '[MEGA LOAD ERROR]',
-        err
-      );
-
-      if (
-        generation !==
-        session.generation
-      ) {
-        return;
-      }
-
-      let message =
-        cleanErrorMessage(err);
-
-      await ctx.telegram.editMessageText(
-        statusMsg.chat.id,
-        statusMsg.message_id,
-        undefined,
-        [
-          '❌ Error loading MEGA link:',
-          '',
-          message
-        ].join('\n')
-      );
-    }
-  }
-);
-
-// ============================================================
-// BROWSER UI
-// ============================================================
-
-async function renderBrowserUI(
-  ctx,
-  editMessageId = null
-) {
-  const session =
-    getSession(ctx.from.id);
-
-  const folder =
-    session.currentFolder;
-
-  if (
-    !folder ||
-    !isDirectory(folder)
-  ) {
-    return safeEditMessage(
-      ctx,
-      '❌ No active MEGA folder.'
+  if (!folder || !isDirectory(folder)) {
+    return ctx.reply(
+      '❌ Session expired. Please send the MEGA link again.'
     );
   }
 
-  // IMPORTANT:
-  // Make sure the folder's children are loaded.
-  await ensureFolderLoaded(
-    folder
+  await ensureFolderLoaded(folder);
+
+  const children = getChildren(folder);
+
+  const folders = children.filter(isDirectory);
+  const files = children.filter(
+    item => !isDirectory(item)
   );
 
-  const children =
-    getChildren(folder);
+  const totalPages = Math.max(
+    1,
+    Math.ceil(
+      files.length / ITEMS_PER_PAGE
+    )
+  );
 
-  const folders =
-    children
-      .filter(isDirectory)
-      .sort(
-        (a, b) =>
-          getNodeName(a).localeCompare(
-            getNodeName(b),
-            undefined,
-            {
-              sensitivity: 'base'
-            }
-          )
-      );
-
-  const files =
-    children
-      .filter(
-        child =>
-          !isDirectory(child)
-      )
-      .sort(
-        (a, b) =>
-          getNodeName(a).localeCompare(
-            getNodeName(b),
-            undefined,
-            {
-              sensitivity: 'base'
-            }
-          )
-      );
-
-  const combined =
-    [
-      ...folders,
-      ...files
-    ];
-
-  const totalItems =
-    combined.length;
-
-  const totalPages =
-    Math.max(
-      1,
-      Math.ceil(
-        totalItems /
-        ITEMS_PER_PAGE
-      )
-    );
-
-  if (
-    session.page >=
-    totalPages
-  ) {
-    session.page =
-      totalPages - 1;
+  if (session.page >= totalPages) {
+    session.page = totalPages - 1;
   }
 
-  if (
-    session.page < 0
-  ) {
+  if (session.page < 0) {
     session.page = 0;
   }
 
-  const start =
-    session.page *
-    ITEMS_PER_PAGE;
+  const start = session.page * ITEMS_PER_PAGE;
 
-  const pageItems =
-    combined.slice(
-      start,
-      start +
-      ITEMS_PER_PAGE
-    );
+  const visibleFiles = files.slice(
+    start,
+    start + ITEMS_PER_PAGE
+  );
 
   const buttons = [];
 
-  // ==========================================================
-  // ITEMS
-  // ==========================================================
+  // ----------------------------------------------------------
+  // FOLDERS
+  // ----------------------------------------------------------
 
-  for (
-    const item of pageItems
-  ) {
-    const id =
-      getNodeId(item);
+  for (const item of folders) {
+    /*
+     * IMPORTANT FIX:
+     *
+     * Do NOT put getNodeId(item) into the callback and then
+     * search the current folder by ID.
+     *
+     * MEGAJS can expose different ID properties depending on
+     * the node/link structure.
+     *
+     * Instead, use the folder's index inside the current
+     * folder's children array.
+     */
+    const folderIndex = children.indexOf(item);
+
+    buttons.push([
+      Markup.button.callback(
+        `📂 ${truncate(getNodeName(item))}`,
+        `nav_folder_index_${folderIndex}`
+      )
+    ]);
+  }
+
+  // ----------------------------------------------------------
+  // FILES
+  // ----------------------------------------------------------
+
+  for (const item of visibleFiles) {
+    const id = getNodeId(item);
 
     if (!id) {
       continue;
     }
 
-    const displayName =
-      truncateText(
-        getNodeName(item),
-        42
-      );
-
-    if (
-      isDirectory(item)
-    ) {
-      buttons.push([
-        Markup.button.callback(
-          `📂 ${displayName}`,
-          `nav_folder_${id}`
-        )
-      ]);
-
-      continue;
-    }
-
-    const selected =
-      session.selectedIds.has(
-        id
-      );
-
-    const mark =
-      selected
-        ? '☑️'
-        : '⬜';
+    const selected = session.selectedIds.has(id);
 
     buttons.push([
       Markup.button.callback(
-        `${mark} ${displayName} (${formatBytes(item.size)})`,
-        `toggle_file_${id}`
+        `${selected ? '☑️' : '⬜'} ${truncate(getNodeName(item))}`,
+        `toggle_file_${encodeURIComponent(id)}`
       )
     ]);
   }
 
-  // ==========================================================
-  // SELECT CONTROLS
-  // ==========================================================
+  // ----------------------------------------------------------
+  // ACTIONS
+  // ----------------------------------------------------------
 
-  const selectionRow = [];
-
-  if (
-    files.length > 0
-  ) {
-    selectionRow.push(
+  if (files.length > 0) {
+    buttons.push([
       Markup.button.callback(
-        '☑️ Select All Here',
+        '✅ Select All Here',
         'action_select_all_here'
       )
-    );
+    ]);
   }
 
-  if (
-    session.selectedIds.size >
-    0
-  ) {
-    selectionRow.push(
+  if (session.selectedIds.size > 0) {
+    buttons.push([
       Markup.button.callback(
-        `⬇️ Selected (${session.selectedIds.size})`,
+        `⬇️ Download Selected (${session.selectedIds.size})`,
         'action_dl_selected'
       )
-    );
+    ]);
   }
-
-  if (
-    selectionRow.length > 0
-  ) {
-    buttons.push(
-      selectionRow
-    );
-  }
-
-  // ==========================================================
-  // DOWNLOAD CONTROLS
-  // ==========================================================
 
   buttons.push([
     Markup.button.callback(
-      '⬇️ Download All',
-      'action_dl_all'
-    ),
-    Markup.button.callback(
-      '📦 This Folder',
+      '📥 Download This Folder',
       'action_dl_folder'
     )
   ]);
 
-  // ==========================================================
+  buttons.push([
+    Markup.button.callback(
+      '📦 Download All',
+      'action_dl_all'
+    )
+  ]);
+
+  // ----------------------------------------------------------
   // PAGINATION
-  // ==========================================================
+  // ----------------------------------------------------------
 
-  if (
-    totalPages > 1
-  ) {
-    const pagination = [];
+  if (totalPages > 1) {
+    const pageButtons = [];
 
-    if (
-      session.page > 0
-    ) {
-      pagination.push(
+    if (session.page > 0) {
+      pageButtons.push(
         Markup.button.callback(
-          '◀️ Prev',
+          '⬅️ Previous',
           `page_${session.page - 1}`
         )
       );
     }
 
-    pagination.push(
+    pageButtons.push(
       Markup.button.callback(
-        `Page ${session.page + 1}/${totalPages}`,
+        `${session.page + 1}/${totalPages}`,
         'noop'
       )
     );
 
-    if (
-      session.page <
-      totalPages - 1
-    ) {
-      pagination.push(
+    if (session.page < totalPages - 1) {
+      pageButtons.push(
         Markup.button.callback(
-          'Next ▶️',
+          'Next ➡️',
           `page_${session.page + 1}`
         )
       );
     }
 
-    buttons.push(
-      pagination
-    );
+    buttons.push(pageButtons);
   }
 
-  // ==========================================================
+  // ----------------------------------------------------------
   // NAVIGATION
-  // ==========================================================
+  // ----------------------------------------------------------
 
   const navigation = [];
 
-  if (
-    session.pathStack.length >
-    0
-  ) {
+  if (session.pathStack.length > 0) {
     navigation.push(
       Markup.button.callback(
         '⬅️ Back',
         'nav_back'
       )
     );
+  }
 
+  if (
+    session.rootNode &&
+    session.currentFolder !== session.rootNode
+  ) {
     navigation.push(
       Markup.button.callback(
         '🏠 Root',
@@ -1626,78 +807,134 @@ async function renderBrowserUI(
     )
   );
 
-  buttons.push(
-    navigation
-  );
+  buttons.push(navigation);
 
-  // ==========================================================
-  // HEADER
-  // ==========================================================
+  // ----------------------------------------------------------
+  // MESSAGE
+  // ----------------------------------------------------------
 
-  const header = [
-    `📁 ${truncateText(getNodeName(folder), 80)}`,
+  const folderName = getNodeName(folder);
+
+  let text = [
+    `📂 ${escapeHtml(folderName)}`,
     '',
-    `📂 Folders: ${folders.length}`,
-    `📄 Files: ${files.length}`,
-    `📑 Page: ${session.page + 1}/${totalPages}`
-  ];
+    `Folders: ${folders.length}`,
+    `Files: ${files.length}`,
+    `Selected: ${session.selectedIds.size}`,
+    ''
+  ].join('\n');
 
-  if (
-    session.selectedIds.size >
-    0
-  ) {
-    header.push(
-      `☑️ Selected: ${session.selectedIds.size}`
-    );
+  if (files.length === 0 && folders.length === 0) {
+    text += 'This folder is empty.';
+  } else if (folders.length > 0 || files.length > 0) {
+    text += 'Select a folder or choose files to download.';
   }
 
-  const text =
-    header.join('\n');
-
-  const markup =
-    Markup.inlineKeyboard(
-      buttons
+  try {
+    await ctx.editMessageText(
+      text,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard(buttons)
+      }
     );
+  } catch (err) {
+    /*
+     * If the message cannot be edited because the user sent
+     * the command from a normal chat message, send a new one.
+     */
+    if (
+      !String(err.message || '')
+        .toLowerCase()
+        .includes('message is not modified')
+    ) {
+      try {
+        await ctx.reply(
+          text,
+          {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard(buttons)
+          }
+        );
+      } catch (replyError) {
+        console.error(
+          '[UI REPLY ERROR]',
+          replyError
+        );
+      }
+    }
+  }
+}
+
+// ============================================================
+// DIRECT FILE UI
+// ============================================================
+
+async function showDirectFile(ctx, file) {
+  const name = getNodeName(file);
+  const size = file.size;
+
+  await ctx.reply(
+    [
+      '📄 FILE FOUND',
+      '',
+      `Name: ${name}`,
+      `Size: ${formatBytes(size)}`,
+      '',
+      'Press the button below to download it.'
+    ].join('\n'),
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback(
+          '⬇️ Download File',
+          'dl_single_file'
+        )
+      ],
+      [
+        Markup.button.callback(
+          '❌ Cancel',
+          'cancel_session'
+        )
+      ]
+    ])
+  );
+}
+
+// ============================================================
+// PROGRESS MESSAGE
+// ============================================================
+
+async function updateProgressMessage(
+  ctx,
+  session,
+  text,
+  force = false
+) {
+  const now = Date.now();
+
+  if (
+    !force &&
+    now - session.lastMsgEditTime <
+      PROGRESS_EDIT_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  session.lastMsgEditTime = now;
 
   try {
-    if (
-      editMessageId
-    ) {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        editMessageId,
-        undefined,
-        text,
-        markup
-      );
-    } else if (
-      ctx.callbackQuery &&
-      ctx.callbackQuery.message
-    ) {
-      await ctx.telegram.editMessageText(
-        ctx.callbackQuery.message.chat.id,
-        ctx.callbackQuery.message.message_id,
-        undefined,
-        text,
-        markup
-      );
-    } else {
-      await ctx.reply(
-        text,
-        markup
-      );
-    }
+    await ctx.editMessageText(text);
   } catch (err) {
+    const message = String(
+      err.message || ''
+    ).toLowerCase();
+
     if (
-      !String(
-        err.description || ''
-      ).toLowerCase()
-      .includes(
-        'message is not modified'
-      )
+      !message.includes('message is not modified') &&
+      !message.includes('message to edit not found')
     ) {
       console.error(
-        '[BROWSER UI ERROR]',
+        '[PROGRESS EDIT ERROR]',
         err.message
       );
     }
@@ -1705,36 +942,748 @@ async function renderBrowserUI(
 }
 
 // ============================================================
-// NOOP
+// DOWNLOAD ONE MEGA FILE TO DISK
 // ============================================================
 
-bot.action(
-  'noop',
-  async ctx => {
-    await ctx.answerCbQuery();
+async function downloadMegaFileToDisk(
+  node,
+  tempFilePath,
+  job,
+  onProgress
+) {
+  return new Promise(async (resolve, reject) => {
+    let stream = null;
+    let writeStream = null;
+
+    let settled = false;
+    let lastProgressTime = 0;
+
+    const finishResolve = value => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      resolve(value);
+    };
+
+    const finishReject = error => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      reject(error);
+    };
+
+    try {
+      if (job.cancelled) {
+        return finishReject(
+          new Error('Download cancelled.')
+        );
+      }
+
+      stream = node.download();
+
+      writeStream = fs.createWriteStream(
+        tempFilePath
+      );
+
+      job.stream = stream;
+      job.writeStream = writeStream;
+
+      let downloaded = 0;
+      let total = Number(node.size) || 0;
+
+      stream.on('data', chunk => {
+        if (job.cancelled) {
+          try {
+            stream.destroy();
+          } catch (_) {}
+
+          try {
+            writeStream.destroy();
+          } catch (_) {}
+
+          return;
+        }
+
+        downloaded += chunk.length;
+
+        const now = Date.now();
+
+        if (
+          now - lastProgressTime >=
+          DOWNLOAD_PROGRESS_INTERVAL_MS
+        ) {
+          lastProgressTime = now;
+
+          if (typeof onProgress === 'function') {
+            onProgress(
+              downloaded,
+              total
+            );
+          }
+        }
+      });
+
+      stream.on('progress', progress => {
+        if (
+          typeof progress === 'number' &&
+          progress >= 0 &&
+          progress <= 1
+        ) {
+          const downloadedFromProgress =
+            total > 0
+              ? Math.floor(total * progress)
+              : 0;
+
+          const now = Date.now();
+
+          if (
+            now - lastProgressTime >=
+            DOWNLOAD_PROGRESS_INTERVAL_MS
+          ) {
+            lastProgressTime = now;
+
+            if (typeof onProgress === 'function') {
+              onProgress(
+                downloadedFromProgress,
+                total
+              );
+            }
+          }
+        }
+      });
+
+      stream.on('error', error => {
+        try {
+          writeStream.destroy();
+        } catch (_) {}
+
+        finishReject(error);
+      });
+
+      writeStream.on('error', error => {
+        try {
+          stream.destroy();
+        } catch (_) {}
+
+        finishReject(error);
+      });
+
+      writeStream.on('finish', () => {
+        if (job.cancelled) {
+          return finishReject(
+            new Error('Download cancelled.')
+          );
+        }
+
+        if (typeof onProgress === 'function') {
+          onProgress(
+            total || downloaded,
+            total || downloaded
+          );
+        }
+
+        finishResolve({
+          downloadedBytes:
+            total || downloaded
+        });
+      });
+
+      stream.pipe(writeStream);
+
+    } catch (error) {
+      try {
+        if (stream) {
+          stream.destroy();
+        }
+      } catch (_) {}
+
+      try {
+        if (writeStream) {
+          writeStream.destroy();
+        }
+      } catch (_) {}
+
+      finishReject(error);
+    }
+  });
+}
+
+// ============================================================
+// TELEGRAM UPLOAD
+// ============================================================
+
+async function uploadFileToTelegram(
+  ctx,
+  filePath,
+  originalName
+) {
+  /*
+   * Always upload as a DOCUMENT.
+   *
+   * This avoids Telegram treating images/videos/audio as
+   * normal media and potentially changing how they are
+   * processed/displayed.
+   */
+  await ctx.replyWithDocument({
+    source: filePath,
+    filename: sanitizeFilename(originalName)
+  });
+}
+
+// ============================================================
+// BATCH DOWNLOAD
+// ============================================================
+
+async function executeBatchDownload(
+  ctx,
+  session,
+  files,
+  title = 'Download'
+) {
+  if (session.activeJob) {
+    await ctx.reply(
+      '⚠️ A download is already running. Use /cancel to stop it.'
+    );
+
+    return;
   }
-);
+
+  const uniqueFiles = [];
+  const seen = new Set();
+
+  for (const file of files) {
+    if (!file || isDirectory(file)) {
+      continue;
+    }
+
+    const id = getNodeId(file);
+
+    /*
+     * Some MEGA objects may not expose the expected ID.
+     * Use object reference as a fallback.
+     */
+    const key = id || file;
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    uniqueFiles.push(file);
+  }
+
+  if (uniqueFiles.length === 0) {
+    await ctx.reply(
+      '❌ No files were found to download.'
+    );
+
+    return;
+  }
+
+  const job = {
+    cancelled: false,
+    stream: null,
+    writeStream: null,
+    tempFilePath: null,
+    startedAt: Date.now()
+  };
+
+  session.activeJob = job;
+  session.touch();
+
+  let completed = 0;
+  let failed = 0;
+  let cancelled = false;
+
+  try {
+    await ctx.reply(
+      [
+        `🚀 ${title}`,
+        '',
+        `Files: ${uniqueFiles.length}`,
+        '',
+        'Starting download...'
+      ].join('\n')
+    );
+
+    for (
+      let index = 0;
+      index < uniqueFiles.length;
+      index++
+    ) {
+      if (job.cancelled) {
+        cancelled = true;
+        break;
+      }
+
+      const file = uniqueFiles[index];
+
+      const fileName = getNodeName(file);
+      const safeName = sanitizeFilename(fileName);
+
+      const tempFilePath =
+        makeTempFilePath(safeName);
+
+      job.tempFilePath = tempFilePath;
+      job.stream = null;
+      job.writeStream = null;
+
+      const fileNumber = index + 1;
+
+      try {
+        await ctx.reply(
+          [
+            `⬇️ Downloading ${fileNumber}/${uniqueFiles.length}`,
+            '',
+            `📄 ${truncate(fileName, 100)}`,
+            `📦 Size: ${formatBytes(file.size)}`
+          ].join('\n')
+        );
+
+        await downloadMegaFileToDisk(
+          file,
+          tempFilePath,
+          job,
+          (downloaded, total) => {
+            const percentage =
+              total > 0
+                ? Math.floor(
+                    (downloaded / total) * 100
+                  )
+                : null;
+
+            let progressText = [
+              `⬇️ Downloading ${fileNumber}/${uniqueFiles.length}`,
+              '',
+              `📄 ${truncate(fileName, 80)}`,
+              '',
+              `Downloaded: ${formatBytes(downloaded)}`
+            ];
+
+            if (total > 0) {
+              progressText.push(
+                `Total: ${formatBytes(total)}`,
+                `Progress: ${percentage}%`
+              );
+            }
+
+            updateProgressMessage(
+              ctx,
+              session,
+              progressText.join('\n')
+            ).catch(() => {});
+          }
+        );
+
+        if (job.cancelled) {
+          cancelled = true;
+          break;
+        }
+
+        await ctx.reply(
+          [
+            `📤 Uploading ${fileNumber}/${uniqueFiles.length}`,
+            '',
+            `📄 ${truncate(fileName, 100)}`
+          ].join('\n')
+        );
+
+        await uploadFileToTelegram(
+          ctx,
+          tempFilePath,
+          fileName
+        );
+
+        completed++;
+
+      } catch (error) {
+        if (
+          job.cancelled ||
+          String(error.message || '')
+            .toLowerCase()
+            .includes('cancelled')
+        ) {
+          cancelled = true;
+          break;
+        }
+
+        failed++;
+
+        console.error(
+          '[FILE DOWNLOAD ERROR]',
+          fileName,
+          error
+        );
+
+        await ctx.reply(
+          [
+            `❌ Failed: ${truncate(fileName, 100)}`,
+            '',
+            cleanErrorMessage(error)
+          ].join('\n')
+        );
+      } finally {
+        job.stream = null;
+        job.writeStream = null;
+
+        await cleanupTempFile(
+          tempFilePath
+        );
+
+        job.tempFilePath = null;
+      }
+    }
+
+    if (job.cancelled) {
+      cancelled = true;
+    }
+
+    if (cancelled) {
+      await ctx.reply(
+        [
+          '🛑 DOWNLOAD CANCELLED',
+          '',
+          `Completed: ${completed}`,
+          `Failed: ${failed}`
+        ].join('\n')
+      );
+    } else {
+      await ctx.reply(
+        [
+          '✅ DOWNLOAD COMPLETE',
+          '',
+          `Completed: ${completed}`,
+          `Failed: ${failed}`,
+          `Total: ${uniqueFiles.length}`
+        ].join('\n')
+      );
+    }
+
+  } catch (error) {
+    console.error(
+      '[BATCH DOWNLOAD ERROR]',
+      error
+    );
+
+    await ctx.reply(
+      [
+        '❌ Download process failed.',
+        '',
+        cleanErrorMessage(error)
+      ].join('\n')
+    );
+
+  } finally {
+    if (job.tempFilePath) {
+      await cleanupTempFile(
+        job.tempFilePath
+      );
+    }
+
+    job.stream = null;
+    job.writeStream = null;
+    session.activeJob = null;
+    session.touch();
+  }
+}
 
 // ============================================================
-// CANCEL CALLBACK
+// START
+// ============================================================
+
+bot.start(async ctx => {
+  const session = getSession(ctx.from.id);
+
+  session.reset();
+
+  await ctx.reply(
+    getStartText()
+  );
+});
+
+// ============================================================
+// HELP
+// ============================================================
+
+bot.command('help', async ctx => {
+  await ctx.reply(
+    getHelpText()
+  );
+});
+
+// ============================================================
+// CANCEL COMMAND
+// ============================================================
+
+bot.command('cancel', async ctx => {
+  const session = getSession(ctx.from.id);
+
+  if (session.activeJob) {
+    session.cancelActiveJob();
+
+    await ctx.reply(
+      '🛑 Cancellation requested. The current download will stop.'
+    );
+
+    return;
+  }
+
+  session.reset();
+
+  await ctx.reply(
+    '❌ Current MEGA session cancelled.'
+  );
+});
+
+// ============================================================
+// TEXT HANDLER — MEGA LINKS
+// ============================================================
+
+bot.on('text', async ctx => {
+  const text = String(
+    ctx.message.text || ''
+  ).trim();
+
+  if (
+    text.startsWith('/') ||
+    !/mega(?:\.nz|\.co\.nz)/i.test(text)
+  ) {
+    return;
+  }
+
+  const session = getSession(ctx.from.id);
+
+  if (session.activeJob) {
+    await ctx.reply(
+      '⚠️ A download is currently running. Use /cancel first.'
+    );
+
+    return;
+  }
+
+  const parsed = parseMegaUrl(text);
+
+  if (parsed.type === 'unknown') {
+    await ctx.reply(
+      '❌ I could not recognize that MEGA link.'
+    );
+
+    return;
+  }
+
+  // Invalidate previous asynchronous link loading.
+  const generation = session.invalidate();
+
+  session.resetBrowser();
+
+  await ctx.reply(
+    '🔎 MEGA link received. Checking the contents...'
+  );
+
+  try {
+    // --------------------------------------------------------
+    // DIRECT FILE
+    // --------------------------------------------------------
+
+    if (parsed.type === 'file') {
+      const file = await loadMegaNode(text);
+
+      if (
+        session.generation !== generation
+      ) {
+        return;
+      }
+
+      if (isDirectory(file)) {
+        /*
+         * Some links may technically parse as file links
+         * while representing a folder. Treat it as a folder.
+         */
+        session.rootNode = file;
+        session.currentFolder = file;
+        session.pathStack = [];
+        session.selectedIds.clear();
+        session.page = 0;
+
+        await renderBrowserUI(ctx);
+
+        return;
+      }
+
+      session.rootNode = file;
+      session.currentFolder = null;
+
+      await showDirectFile(
+        ctx,
+        file
+      );
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // FOLDER
+    // --------------------------------------------------------
+
+    const rootUrl =
+      `https://mega.nz/folder/${parsed.rootId}#${parsed.key}`;
+
+    const rootFolder =
+      await loadMegaFolder(rootUrl);
+
+    if (
+      session.generation !== generation
+    ) {
+      return;
+    }
+
+    session.rootNode = rootFolder;
+    session.currentFolder = rootFolder;
+    session.pathStack = [];
+    session.selectedIds.clear();
+    session.page = 0;
+
+    // If the URL points directly to a nested folder/file,
+    // locate it asynchronously through the MEGA tree.
+    if (
+      parsed.targetId &&
+      parsed.targetId !== parsed.rootId
+    ) {
+      const target =
+        await findNodeByIdAsync(
+          rootFolder,
+          parsed.targetId
+        );
+
+      if (!target) {
+        throw new Error(
+          'The requested folder or file could not be found inside this MEGA share.'
+        );
+      }
+
+      if (isDirectory(target)) {
+        const pathToTarget =
+          await buildPathToNodeAsync(
+            rootFolder,
+            parsed.targetId
+          );
+
+        if (Array.isArray(pathToTarget)) {
+          session.pathStack = [];
+
+          let previous =
+            rootFolder;
+
+          for (const folder of pathToTarget) {
+            if (!folder) {
+              continue;
+            }
+
+            session.pathStack.push({
+              id: getNodeId(previous),
+              name: getNodeName(previous),
+              node: previous
+            });
+
+            previous = folder;
+          }
+        }
+
+        session.currentFolder = target;
+        session.page = 0;
+
+        await ensureFolderLoaded(
+          target
+        );
+
+        await renderBrowserUI(ctx);
+
+        return;
+      }
+
+      // Direct file inside a folder share.
+      session.currentFolder = null;
+      session.rootNode = target;
+
+      await showDirectFile(
+        ctx,
+        target
+      );
+
+      return;
+    }
+
+    await renderBrowserUI(ctx);
+
+  } catch (error) {
+    console.error(
+      '[MEGA LINK ERROR]',
+      error
+    );
+
+    if (
+      session.generation !== generation
+    ) {
+      return;
+    }
+
+    await ctx.reply(
+      [
+        '❌ Could not load the MEGA link.',
+        '',
+        cleanErrorMessage(error),
+        '',
+        'Please make sure the link is public and still available.'
+      ].join('\n')
+    );
+  }
+});
+
+// ============================================================
+// NO-OP CALLBACK
+// ============================================================
+
+bot.action('noop', async ctx => {
+  await ctx.answerCbQuery();
+});
+
+// ============================================================
+// CANCEL BUTTON
 // ============================================================
 
 bot.action(
   'cancel_session',
   async ctx => {
-    await ctx.answerCbQuery(
-      'Session cancelled'
-    );
+    await ctx.answerCbQuery();
 
     const session =
       getSession(ctx.from.id);
 
+    if (session.activeJob) {
+      session.cancelActiveJob();
+
+      await ctx.reply(
+        '🛑 Cancellation requested. The current download will stop.'
+      );
+
+      return;
+    }
+
     session.reset();
 
-    await safeEditMessage(
-      ctx,
-      '❌ MEGA session cancelled.'
-    );
+    try {
+      await ctx.editMessageText(
+        '❌ MEGA session cancelled.'
+      );
+    } catch (_) {
+      await ctx.reply(
+        '❌ MEGA session cancelled.'
+      );
+    }
   }
 );
 
@@ -1756,44 +1705,62 @@ bot.action(
     const session =
       getSession(ctx.from.id);
 
-    if (
-      session.activeJob
-    ) {
+    if (session.activeJob) {
+      await ctx.reply(
+        '⚠️ A download is currently running. Use /cancel to stop it.'
+      );
+
       return;
     }
 
-    session.page =
-      Number.isFinite(page)
-        ? page
-        : 0;
+    if (!Number.isInteger(page)) {
+      return;
+    }
 
-    await renderBrowserUI(
-      ctx
+    session.page = Math.max(
+      0,
+      page
     );
+
+    try {
+      await renderBrowserUI(ctx);
+    } catch (error) {
+      console.error(
+        '[PAGE ERROR]',
+        error
+      );
+
+      await ctx.reply(
+        '❌ Could not change page.'
+      );
+    }
   }
 );
 
 // ============================================================
-// OPEN FOLDER
+// OPEN FOLDER — FIXED VERSION
 // ============================================================
 
 bot.action(
-  /^nav_folder_(.+)$/,
+  /^nav_folder_index_(\d+)$/,
   async ctx => {
     await ctx.answerCbQuery();
 
-    const targetId =
-      ctx.match[1];
+    const index =
+      Number.parseInt(
+        ctx.match[1],
+        10
+      );
 
     const session =
       getSession(ctx.from.id);
 
-    if (
-      session.activeJob
-    ) {
-      return ctx.reply(
-        '⚠️ A download is currently running. Use /cancel first.'
+    if (session.activeJob) {
+      await ctx.reply(
+        '⚠️ A download is currently running. Use /cancel to stop it.'
       );
+
+      return;
     }
 
     const current =
@@ -1803,70 +1770,77 @@ bot.action(
       !current ||
       !isDirectory(current)
     ) {
-      return ctx.reply(
+      await ctx.reply(
         '❌ Session expired. Please send the MEGA link again.'
       );
+
+      return;
     }
 
     try {
+      /*
+       * Make sure the current folder's children are actually
+       * loaded before using the index.
+       */
       await ensureFolderLoaded(
         current
       );
 
-      const target =
-        getChildren(current)
-          .find(
-            child =>
-              isDirectory(child) &&
-              getNodeId(child) ===
-                targetId
-          );
-
-      if (!target) {
-        return ctx.reply(
-          '❌ Folder not found in the current MEGA folder.'
-        );
-      }
+      const children =
+        getChildren(current);
 
       /*
        * THIS IS THE IMPORTANT FIX.
        *
-       * The child folder is explicitly loaded before
-       * becoming the current folder.
+       * The callback contains the array index instead of a
+       * MEGA node ID. Therefore we retrieve the exact object
+       * that generated the button.
        */
+      const target =
+        children[index];
 
+      if (
+        !target ||
+        !isDirectory(target)
+      ) {
+        await ctx.reply(
+          '❌ That folder could not be found. Please reopen the MEGA link.'
+        );
+
+        return;
+      }
+
+      /*
+       * Load the selected folder's children before navigating
+       * into it. This also fixes nested-folder browsing when
+       * MEGAJS has not populated children yet.
+       */
       await ensureFolderLoaded(
         target
       );
 
       session.pathStack.push({
-        id:
-          getNodeId(current),
-        name:
-          getNodeName(current),
-        node:
-          current
+        id: getNodeId(current),
+        name: getNodeName(current),
+        node: current
       });
 
-      session.currentFolder =
-        target;
-
+      session.currentFolder = target;
       session.page = 0;
 
-      await renderBrowserUI(
-        ctx
-      );
-    } catch (err) {
+      await renderBrowserUI(ctx);
+
+    } catch (error) {
       console.error(
         '[OPEN FOLDER ERROR]',
-        err
+        error
       );
 
       await ctx.reply(
         [
           '❌ Could not open this folder.',
           '',
-          cleanErrorMessage(err)
+          cleanErrorMessage(error)
         ].join('\n')
       );
     }
@@ -1885,36 +1859,57 @@ bot.action(
     const session =
       getSession(ctx.from.id);
 
-    if (
-      session.activeJob
-    ) {
+    if (session.activeJob) {
+      await ctx.reply(
+        '⚠️ A download is currently running. Use /cancel to stop it.'
+      );
+
       return;
     }
 
     if (
-      session.pathStack.length ===
-      0
+      session.pathStack.length === 0
     ) {
-      return renderBrowserUI(
-        ctx
-      );
+      await renderBrowserUI(ctx);
+      return;
     }
 
-    const parent =
+    const previous =
       session.pathStack.pop();
 
-    session.currentFolder =
-      parent.node;
+    if (
+      !previous ||
+      !previous.node
+    ) {
+      await ctx.reply(
+        '❌ Navigation state was lost. Please reopen the MEGA link.'
+      );
 
-    await ensureFolderLoaded(
-      session.currentFolder
-    );
+      return;
+    }
+
+    session.currentFolder =
+      previous.node;
 
     session.page = 0;
 
-    await renderBrowserUI(
-      ctx
-    );
+    try {
+      await ensureFolderLoaded(
+        session.currentFolder
+      );
+
+      await renderBrowserUI(ctx);
+
+    } catch (error) {
+      console.error(
+        '[BACK ERROR]',
+        error
+      );
+
+      await ctx.reply(
+        '❌ Could not go back to the previous folder.'
+      );
+    }
   }
 );
 
@@ -1930,46 +1925,46 @@ bot.action(
     const session =
       getSession(ctx.from.id);
 
-    if (
-      session.activeJob
-    ) {
+    if (session.activeJob) {
+      await ctx.reply(
+        '⚠️ A download is currently running. Use /cancel to stop it.'
+      );
+
       return;
     }
 
     if (
       !session.rootNode ||
-      !isDirectory(
-        session.rootNode
-      )
+      !isDirectory(session.rootNode)
     ) {
-      return ctx.reply(
-        '❌ Root folder is no longer available.'
+      await ctx.reply(
+        '❌ Root folder is no longer available. Please reopen the MEGA link.'
       );
+
+      return;
     }
+
+    session.currentFolder =
+      session.rootNode;
+
+    session.pathStack = [];
+    session.page = 0;
 
     try {
       await ensureFolderLoaded(
         session.rootNode
       );
 
-      session.currentFolder =
-        session.rootNode;
+      await renderBrowserUI(ctx);
 
-      session.pathStack =
-        [];
-
-      session.page = 0;
-
-      await renderBrowserUI(
-        ctx
+    } catch (error) {
+      console.error(
+        '[ROOT ERROR]',
+        error
       );
-    } catch (err) {
+
       await ctx.reply(
-        [
-          '❌ Could not open root folder.',
-          '',
-          cleanErrorMessage(err)
-        ].join('\n')
+        '❌ Could not return to the root folder.'
       );
     }
   }
@@ -1984,35 +1979,42 @@ bot.action(
   async ctx => {
     await ctx.answerCbQuery();
 
-    const fileId =
-      ctx.match[1];
-
     const session =
       getSession(ctx.from.id);
 
-    if (
-      session.activeJob
-    ) {
+    if (session.activeJob) {
+      await ctx.reply(
+        '⚠️ A download is currently running. Use /cancel to stop it.'
+      );
+
       return;
     }
 
+    const id =
+      decodeURIComponent(
+        ctx.match[1]
+      );
+
     if (
-      session.selectedIds.has(
-        fileId
-      )
+      session.selectedIds.has(id)
     ) {
-      session.selectedIds.delete(
-        fileId
-      );
+      session.selectedIds.delete(id);
     } else {
-      session.selectedIds.add(
-        fileId
-      );
+      session.selectedIds.add(id);
     }
 
-    await renderBrowserUI(
-      ctx
-    );
+    try {
+      await renderBrowserUI(ctx);
+    } catch (error) {
+      console.error(
+        '[TOGGLE FILE ERROR]',
+        error
+      );
+
+      await ctx.reply(
+        '❌ Could not update file selection.'
+      );
+    }
   }
 );
 
@@ -2028,73 +2030,67 @@ bot.action(
     const session =
       getSession(ctx.from.id);
 
-    if (
-      session.activeJob
-    ) {
-      return;
-    }
-
-    if (
-      !session.currentFolder
-    ) {
-      return;
-    }
-
-    await ensureFolderLoaded(
-      session.currentFolder
-    );
-
-    const files =
-      getChildren(
-        session.currentFolder
-      ).filter(
-        child =>
-          !isDirectory(child)
+    if (session.activeJob) {
+      await ctx.reply(
+        '⚠️ A download is currently running. Use /cancel to stop it.'
       );
 
-    if (
-      files.length === 0
-    ) {
       return;
     }
 
-    const allSelected =
-      files.every(
-        file =>
-          session.selectedIds.has(
-            getNodeId(file)
-          )
+    const folder =
+      session.currentFolder;
+
+    if (
+      !folder ||
+      !isDirectory(folder)
+    ) {
+      await ctx.reply(
+        '❌ Folder session expired.'
       );
 
-    for (
-      const file of files
-    ) {
-      const id =
-        getNodeId(file);
-
-      if (!id) {
-        continue;
-      }
-
-      if (allSelected) {
-        session.selectedIds.delete(
-          id
-        );
-      } else {
-        session.selectedIds.add(
-          id
-        );
-      }
+      return;
     }
 
-    await renderBrowserUI(
-      ctx
-    );
+    try {
+      await ensureFolderLoaded(
+        folder
+      );
+
+      const children =
+        getChildren(folder);
+
+      const files =
+        children.filter(
+          item => !isDirectory(item)
+        );
+
+      for (const file of files) {
+        const id =
+          getNodeId(file);
+
+        if (id) {
+          session.selectedIds.add(id);
+        }
+      }
+
+      await renderBrowserUI(ctx);
+
+    } catch (error) {
+      console.error(
+        '[SELECT ALL ERROR]',
+        error
+      );
+
+      await ctx.reply(
+        '❌ Could not select the files.'
+      );
+    }
   }
 );
 
 // ============================================================
-// DIRECT FILE DOWNLOAD
+// DOWNLOAD SINGLE FILE
 // ============================================================
 
 bot.action(
@@ -2105,22 +2101,33 @@ bot.action(
     const session =
       getSession(ctx.from.id);
 
-    if (
-      !session.rootNode ||
-      isDirectory(
-        session.rootNode
-      )
-    ) {
-      return ctx.reply(
-        '❌ No downloadable file is ready.'
+    if (session.activeJob) {
+      await ctx.reply(
+        '⚠️ A download is already running.'
       );
+
+      return;
+    }
+
+    const file =
+      session.rootNode;
+
+    if (
+      !file ||
+      isDirectory(file)
+    ) {
+      await ctx.reply(
+        '❌ File session expired. Please send the MEGA link again.'
+      );
+
+      return;
     }
 
     await executeBatchDownload(
       ctx,
-      [
-        session.rootNode
-      ]
+      session,
+      [file],
+      'Downloading File'
     );
   }
 );
@@ -2137,66 +2144,88 @@ bot.action(
     const session =
       getSession(ctx.from.id);
 
-    if (
-      session.activeJob
-    ) {
-      return ctx.reply(
-        '⚠️ A download is already running. Use /cancel to stop it.'
+    if (session.activeJob) {
+      await ctx.reply(
+        '⚠️ A download is already running.'
       );
+
+      return;
     }
 
     if (
-      !session.rootNode &&
-      !session.currentFolder
+      !session.rootNode ||
+      !isDirectory(session.rootNode)
     ) {
-      return ctx.reply(
-        '❌ No active MEGA session.'
+      await ctx.reply(
+        '❌ Folder session expired. Please send the MEGA link again.'
       );
+
+      return;
     }
-
-    const root =
-      isDirectory(
-        session.rootNode
-      )
-        ? session.rootNode
-        : session.currentFolder;
-
-    if (!root) {
-      return ctx.reply(
-        '❌ No active MEGA folder.'
-      );
-    }
-
-    const allFiles =
-      collectAllFilesSync(
-        root
-      );
-
-    const selectedFiles =
-      allFiles.filter(
-        file =>
-          session.selectedIds.has(
-            getNodeId(file)
-          )
-      );
 
     if (
-      selectedFiles.length === 0
+      session.selectedIds.size === 0
     ) {
-      return ctx.reply(
-        '⚠️ No selected files were found.'
+      await ctx.reply(
+        '❌ No files selected.'
       );
+
+      return;
     }
 
-    await executeBatchDownload(
-      ctx,
-      selectedFiles
-    );
+    try {
+      const allFiles =
+        await collectAllFiles(
+          session.rootNode
+        );
+
+      const selectedFiles =
+        allFiles.filter(file => {
+          const id =
+            getNodeId(file);
+
+          return (
+            id &&
+            session.selectedIds.has(id)
+          );
+        });
+
+      if (
+        selectedFiles.length === 0
+      ) {
+        await ctx.reply(
+          '❌ The selected files could not be found. Please select them again.'
+        );
+
+        return;
+      }
+
+      await executeBatchDownload(
+        ctx,
+        session,
+        selectedFiles,
+        'Downloading Selected Files'
+      );
+
+    } catch (error) {
+      console.error(
+        '[DOWNLOAD SELECTED ERROR]',
+        error
+      );
+
+      await ctx.reply(
+        [
+          '❌ Could not prepare the selected files.',
+          '',
+          cleanErrorMessage(error)
+        ].join('\n')
+      );
+    }
   }
 );
 
 // ============================================================
-// DOWNLOAD CURRENT FOLDER
+// DOWNLOAD THIS FOLDER
 // ============================================================
 
 bot.action(
@@ -2207,45 +2236,37 @@ bot.action(
     const session =
       getSession(ctx.from.id);
 
-    if (
-      session.activeJob
-    ) {
-      return ctx.reply(
-        '⚠️ A download is already running. Use /cancel to stop it.'
-      );
-    }
-
-    if (
-      !session.currentFolder
-    ) {
-      return ctx.reply(
-        '❌ No active folder.'
-      );
-    }
-
-    const status =
+    if (session.activeJob) {
       await ctx.reply(
-        '📦 Scanning this folder recursively...'
+        '⚠️ A download is already running.'
       );
+
+      return;
+    }
+
+    const folder =
+      session.currentFolder;
+
+    if (
+      !folder ||
+      !isDirectory(folder)
+    ) {
+      await ctx.reply(
+        '❌ Current folder is unavailable.'
+      );
+
+      return;
+    }
 
     try {
-      await ensureFolderLoaded(
-        session.currentFolder
-      );
-
       const files =
-        collectAllFilesSync(
-          session.currentFolder
+        await collectAllFiles(
+          folder
         );
 
-      if (
-        files.length === 0
-      ) {
-        await ctx.telegram.editMessageText(
-          status.chat.id,
-          status.message_id,
-          undefined,
-          '⚠️ No downloadable files were found in this folder.'
+      if (files.length === 0) {
+        await ctx.reply(
+          '📂 This folder does not contain any files.'
         );
 
         return;
@@ -2253,23 +2274,22 @@ bot.action(
 
       await executeBatchDownload(
         ctx,
+        session,
         files,
-        status.message_id
-      );
-    } catch (err) {
-      console.error(
-        '[FOLDER SCAN ERROR]',
-        err
+        `Downloading ${getNodeName(folder)}`
       );
 
-      await ctx.telegram.editMessageText(
-        status.chat.id,
-        status.message_id,
-        undefined,
+    } catch (error) {
+      console.error(
+        '[DOWNLOAD FOLDER ERROR]',
+        error
+      );
+
+      await ctx.reply(
         [
-          '❌ Failed to scan folder:',
+          '❌ Could not prepare this folder.',
           '',
-          cleanErrorMessage(err)
+          cleanErrorMessage(error)
         ].join('\n')
       );
     }
@@ -2277,7 +2297,7 @@ bot.action(
 );
 
 // ============================================================
-// DOWNLOAD EVERYTHING
+// DOWNLOAD ALL
 // ============================================================
 
 bot.action(
@@ -2288,56 +2308,37 @@ bot.action(
     const session =
       getSession(ctx.from.id);
 
-    if (
-      session.activeJob
-    ) {
-      return ctx.reply(
-        '⚠️ A download is already running. Use /cancel to stop it.'
+    if (session.activeJob) {
+      await ctx.reply(
+        '⚠️ A download is already running.'
       );
+
+      return;
     }
 
     const root =
-      session.rootNode ||
-      session.currentFolder;
-
-    if (!root) {
-      return ctx.reply(
-        '❌ No active MEGA session.'
-      );
-    }
+      session.rootNode;
 
     if (
+      !root ||
       !isDirectory(root)
     ) {
-      return executeBatchDownload(
-        ctx,
-        [root]
+      await ctx.reply(
+        '❌ Folder session expired. Please send the MEGA link again.'
       );
+
+      return;
     }
 
-    const status =
-      await ctx.reply(
-        '📦 Scanning all folders recursively...'
-      );
-
     try {
-      await ensureFolderLoaded(
-        root
-      );
-
       const files =
-        collectAllFilesSync(
+        await collectAllFiles(
           root
         );
 
-      if (
-        files.length === 0
-      ) {
-        await ctx.telegram.editMessageText(
-          status.chat.id,
-          status.message_id,
-          undefined,
-          '⚠️ No downloadable files were found.'
+      if (files.length === 0) {
+        await ctx.reply(
+          '📂 This MEGA folder does not contain any files.'
         );
 
         return;
@@ -2345,23 +2346,22 @@ bot.action(
 
       await executeBatchDownload(
         ctx,
+        session,
         files,
-        status.message_id
-      );
-    } catch (err) {
-      console.error(
-        '[ALL FILE SCAN ERROR]',
-        err
+        'Downloading Entire MEGA Folder'
       );
 
-      await ctx.telegram.editMessageText(
-        status.chat.id,
-        status.message_id,
-        undefined,
+    } catch (error) {
+      console.error(
+        '[DOWNLOAD ALL ERROR]',
+        error
+      );
+
+      await ctx.reply(
         [
-          '❌ Failed to scan MEGA files:',
+          '❌ Could not prepare the MEGA folder.',
           '',
-          cleanErrorMessage(err)
+          cleanErrorMessage(error)
         ].join('\n')
       );
     }
@@ -2369,798 +2369,100 @@ bot.action(
 );
 
 // ============================================================
-// DOWNLOAD JOB
+// GENERAL CALLBACK ERROR HANDLING
 // ============================================================
 
-async function executeBatchDownload(
-  ctx,
-  fileNodes,
-  existingMsgId = null
-) {
-  const session =
-    getSession(ctx.from.id);
-
-  if (
-    session.activeJob
-  ) {
-    return ctx.reply(
-      '⚠️ A download is already running.\n\nUse /cancel to stop it.'
-    );
-  }
-
-  const uniqueFiles = [];
-  const seenIds = new Set();
-
-  for (
-    const file of fileNodes
-  ) {
-    if (
-      !file ||
-      isDirectory(file)
-    ) {
-      continue;
-    }
-
-    const id =
-      getNodeId(file);
-
-    if (
-      id &&
-      seenIds.has(id)
-    ) {
-      continue;
-    }
-
-    if (id) {
-      seenIds.add(id);
-    }
-
-    uniqueFiles.push(
-      file
-    );
-  }
-
-  if (
-    uniqueFiles.length === 0
-  ) {
-    return ctx.reply(
-      '⚠️ No downloadable files were found.'
-    );
-  }
-
-  let statusMsg;
-
-  if (
-    existingMsgId
-  ) {
-    statusMsg = {
-      chat: {
-        id: ctx.chat.id
-      },
-      message_id:
-        existingMsgId
-    };
-  } else if (
-    ctx.callbackQuery &&
-    ctx.callbackQuery.message
-  ) {
-    statusMsg =
-      ctx.callbackQuery.message;
-  } else {
-    statusMsg =
-      await ctx.reply(
-        '🚀 Starting download...'
-      );
-  }
-
-  const job = {
-    cancelled: false,
-    stream: null,
-    writeStream: null,
-    tempFilePath: null,
-    messageId:
-      statusMsg.message_id
-  };
-
-  session.activeJob =
-    job;
-
-  const totalFiles =
-    uniqueFiles.length;
-
-  let successfulCount = 0;
-
-  const failedFiles = [];
-
-  console.log(
-    `[DOWNLOAD] Starting ${totalFiles} file(s) for ${ctx.from.id}`
+bot.catch(async (error, ctx) => {
+  console.error(
+    '[TELEGRAF ERROR]',
+    error
   );
 
   try {
-    for (
-      let index = 0;
-      index < totalFiles;
-      index++
-    ) {
-      if (
-        job.cancelled
-      ) {
-        break;
-      }
-
-      const node =
-        uniqueFiles[index];
-
-      const filename =
-        sanitizeFilename(
-          getNodeName(node)
-        );
-
-      const sizeStr =
-        formatBytes(
-          node.size
-        );
-
-      await updateProgressMessage(
-        ctx,
-        job.messageId,
-        [
-          `⬇️ Downloading (${index + 1}/${totalFiles})`,
-          '',
-          `📄 ${filename}`,
-          `📦 Size: ${sizeStr}`,
-          'Progress: 0%'
-        ].join('\n'),
-        true
-      );
-
-      const tempFilePath =
-        makeTempFilePath(
-          filename
-        );
-
-      job.tempFilePath =
-        tempFilePath;
-
-      try {
-        await downloadMegaFileToDisk(
-          node,
-          tempFilePath,
-          ctx,
-          job,
-          index,
-          totalFiles,
-          filename,
-          sizeStr
-        );
-
-        if (
-          job.cancelled
-        ) {
-          throw new Error(
-            'USER_CANCELLED'
-          );
-        }
-
-        await updateProgressMessage(
-          ctx,
-          job.messageId,
-          [
-            `📤 Uploading (${index + 1}/${totalFiles})`,
-            '',
-            `📄 ${filename}`,
-            `📦 Size: ${sizeStr}`
-          ].join('\n'),
-          true
-        );
-
-        await uploadFileToTelegram(
-          ctx,
-          tempFilePath,
-          filename
-        );
-
-        successfulCount++;
-      } catch (err) {
-        if (
-          job.cancelled ||
-          err.message ===
-            'USER_CANCELLED'
-        ) {
-          break;
-        }
-
-        console.error(
-          `[DOWNLOAD ERROR] ${filename}`,
-          err
-        );
-
-        failedFiles.push(
-          `${filename} (${cleanErrorMessage(err)})`
-        );
-      } finally {
-        await cleanupTempFile(
-          tempFilePath
-        );
-
-        job.tempFilePath =
-          null;
-
-        job.stream =
-          null;
-
-        job.writeStream =
-          null;
-      }
-    }
-  } finally {
-    const wasCancelled =
-      job.cancelled;
-
-    if (
-      session.activeJob ===
-      job
-    ) {
-      session.activeJob =
-        null;
-    }
-
-    if (
-      wasCancelled
-    ) {
-      await updateProgressMessage(
-        ctx,
-        job.messageId,
-        '❌ Download task cancelled.',
-        true
-      );
-
-      return;
-    }
-
-    let finalReport;
-
-    if (
-      failedFiles.length ===
-      0
-    ) {
-      finalReport = [
-        '✅ Download complete',
+    await ctx.reply(
+      [
+        '❌ Something went wrong.',
         '',
-        `📦 Files: ${successfulCount}/${totalFiles}`,
-        '🎉 All files were processed successfully.'
-      ].join('\n');
-    } else {
-      finalReport = [
-        '⚠️ Download completed with errors',
-        '',
-        `📦 Total: ${totalFiles}`,
-        `✅ Successful: ${successfulCount}`,
-        `❌ Failed: ${failedFiles.length}`,
-        '',
-        failedFiles
-          .slice(0, 5)
-          .map(
-            item => `• ${item}`
-          )
-          .join('\n')
-      ].join('\n');
-
-      if (
-        failedFiles.length > 5
-      ) {
-        finalReport +=
-          `\n• ...and ${failedFiles.length - 5} more`;
-      }
-    }
-
-    await updateProgressMessage(
-      ctx,
-      job.messageId,
-      finalReport,
-      true
+        cleanErrorMessage(error)
+      ].join('\n')
     );
-  }
-}
-
-// ============================================================
-// MEGA DOWNLOAD TO DISK
-// ============================================================
-
-function downloadMegaFileToDisk(
-  node,
-  tempFilePath,
-  ctx,
-  job,
-  index,
-  totalFiles,
-  filename,
-  sizeStr
-) {
-  return new Promise(
-    (resolve, reject) => {
-      let finished =
-        false;
-
-      let downloadedBytes =
-        0;
-
-      let lastProgressTime =
-        0;
-
-      let downloadStream =
-        null;
-
-      let writeStream =
-        null;
-
-      const cleanupStreams = () => {
-        if (
-          downloadStream &&
-          !downloadStream.destroyed
-        ) {
-          try {
-            downloadStream.destroy();
-          } catch (_) {}
-        }
-
-        if (
-          writeStream &&
-          !writeStream.destroyed
-        ) {
-          try {
-            writeStream.destroy();
-          } catch (_) {}
-        }
-      };
-
-      const finishOnce = (
-        error = null
-      ) => {
-        if (finished) {
-          return;
-        }
-
-        finished = true;
-
-        if (error) {
-          cleanupStreams();
-          reject(error);
-        } else {
-          resolve();
-        }
-      };
-
-      const sendProgress =
-        percent => {
-          updateProgressMessage(
-            ctx,
-            job.messageId,
-            [
-              `⬇️ Downloading (${index + 1}/${totalFiles})`,
-              '',
-              `📄 ${filename}`,
-              `📦 Size: ${sizeStr}`,
-              `Progress: ${percent}%`
-            ].join('\n')
-          ).catch(() => {});
-        };
-
-      try {
-        downloadStream =
-          node.download();
-
-        writeStream =
-          fs.createWriteStream(
-            tempFilePath
-          );
-
-        job.stream =
-          downloadStream;
-
-        job.writeStream =
-          writeStream;
-
-        downloadStream.on(
-          'data',
-          chunk => {
-            if (
-              job.cancelled
-            ) {
-              finishOnce(
-                new Error(
-                  'USER_CANCELLED'
-                )
-              );
-
-              return;
-            }
-
-            downloadedBytes +=
-              chunk.length;
-
-            const now =
-              Date.now();
-
-            if (
-              node.size > 0 &&
-              now -
-                lastProgressTime >=
-                DOWNLOAD_PROGRESS_INTERVAL_MS
-            ) {
-              lastProgressTime =
-                now;
-
-              const percent =
-                Math.min(
-                  100,
-                  Math.floor(
-                    (
-                      downloadedBytes /
-                      node.size
-                    ) * 100
-                  )
-                );
-
-              sendProgress(
-                percent
-              );
-            }
-          }
-        );
-
-        downloadStream.on(
-          'progress',
-          info => {
-            if (
-              job.cancelled ||
-              !info ||
-              !info.bytesTotal
-            ) {
-              return;
-            }
-
-            const now =
-              Date.now();
-
-            if (
-              now -
-                lastProgressTime <
-              DOWNLOAD_PROGRESS_INTERVAL_MS
-            ) {
-              return;
-            }
-
-            lastProgressTime =
-              now;
-
-            const percent =
-              Math.min(
-                100,
-                Math.floor(
-                  (
-                    info.bytesLoaded /
-                    info.bytesTotal
-                  ) * 100
-                )
-              );
-
-            sendProgress(
-              percent
-            );
-          }
-        );
-
-        downloadStream.on(
-          'error',
-          err => {
-            if (
-              job.cancelled ||
-              err.message ===
-                'USER_CANCELLED'
-            ) {
-              finishOnce(
-                new Error(
-                  'USER_CANCELLED'
-                )
-              );
-
-              return;
-            }
-
-            finishOnce(err);
-          }
-        );
-
-        writeStream.on(
-          'error',
-          err => {
-            if (
-              job.cancelled
-            ) {
-              finishOnce(
-                new Error(
-                  'USER_CANCELLED'
-                )
-              );
-
-              return;
-            }
-
-            finishOnce(err);
-          }
-        );
-
-        writeStream.on(
-          'finish',
-          () => {
-            if (
-              job.cancelled
-            ) {
-              finishOnce(
-                new Error(
-                  'USER_CANCELLED'
-                )
-              );
-
-              return;
-            }
-
-            /*
-             * If MEGA supplied a known size, verify that
-             * the resulting file has the expected number
-             * of bytes.
-             */
-
-            if (
-              Number.isFinite(
-                node.size
-              ) &&
-              node.size >= 0 &&
-              downloadedBytes !==
-                node.size
-            ) {
-              finishOnce(
-                new Error(
-                  `Downloaded size mismatch. Expected ${node.size} bytes but received ${downloadedBytes} bytes.`
-                )
-              );
-
-              return;
-            }
-
-            finishOnce();
-          }
-        );
-
-        downloadStream.pipe(
-          writeStream
-        );
-      } catch (err) {
-        finishOnce(err);
-      }
-    }
-  );
-}
-
-// ============================================================
-// TELEGRAM UPLOAD
-// ============================================================
-
-async function uploadFileToTelegram(
-  ctx,
-  filePath,
-  filename
-) {
-  /*
-   * ALWAYS upload as a DOCUMENT.
-   *
-   * Using replyWithPhoto/replyWithVideo/replyWithAudio
-   * can make Telegram process the media instead of treating
-   * it as the original file.
-   *
-   * A document is the safest choice for an exact downloader.
-   */
-
-  const input = {
-    source: filePath,
-    filename
-  };
-
-  const caption =
-    truncateText(
-      filename,
-      900
-    );
-
-  try {
-    await ctx.replyWithDocument(
-      input,
-      {
-        caption
-      }
-    );
-  } catch (err) {
-    const description =
-      String(
-        err.description ||
-        err.message ||
-        ''
-      );
-
-    if (
-      description
-        .toLowerCase()
-        .includes(
-          'file is too large'
-        )
-    ) {
-      throw new Error(
-        'Telegram rejected the file because it is too large for the bot upload limit.'
-      );
-    }
-
-    throw err;
-  }
-}
-
-// ============================================================
-// PROGRESS MESSAGE
-// ============================================================
-
-async function updateProgressMessage(
-  ctx,
-  messageId,
-  text,
-  force = false
-) {
-  const session =
-    getSession(ctx.from.id);
-
-  const now =
-    Date.now();
-
-  if (
-    !force &&
-    now -
-      session.lastMsgEditTime <
-      PROGRESS_EDIT_INTERVAL_MS
-  ) {
-    return;
-  }
-
-  session.lastMsgEditTime =
-    now;
-
-  try {
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      messageId,
-      undefined,
-      text
-    );
-  } catch (err) {
-    const description =
-      String(
-        err.description || ''
-      ).toLowerCase();
-
-    if (
-      !description.includes(
-        'message is not modified'
-      )
-    ) {
-      console.error(
-        '[PROGRESS UPDATE ERROR]',
-        err.message
-      );
-    }
-  }
-}
-
-// ============================================================
-// ERROR HANDLING
-// ============================================================
-
-bot.catch(
-  async (err, ctx) => {
+  } catch (replyError) {
     console.error(
-      `[TELEGRAM ERROR] ${ctx.updateType}`,
-      err
+      '[TELEGRAF ERROR REPLY FAILED]',
+      replyError
+    );
+  }
+});
+
+// ============================================================
+// STARTUP
+// ============================================================
+
+console.log(
+  '🚀 MEGA Downloader Bot starting...'
+);
+
+console.log(
+  `📁 Temporary directory: ${TEMP_DIR}`
+);
+
+bot.launch()
+  .then(() => {
+    console.log(
+      '✅ MEGA Downloader Bot is running.'
+    );
+  })
+  .catch(error => {
+    console.error(
+      '❌ Failed to start bot:',
+      error
     );
 
-    try {
-      await ctx.reply(
-        '❌ An unexpected error occurred while processing your request.'
-      );
-    } catch (_) {}
-  }
-);
+    process.exit(1);
+  });
 
 // ============================================================
 // GRACEFUL SHUTDOWN
 // ============================================================
 
-async function gracefulShutdown(
-  signal
-) {
+async function shutdown(signal) {
   console.log(
-    `[SHUTDOWN] Received ${signal}`
+    `\n🛑 Received ${signal}. Shutting down...`
   );
 
-  for (
-    const session of
-    userSessions.values()
-  ) {
-    try {
+  for (const session of sessions.values()) {
+    if (session.activeJob) {
       session.cancelActiveJob();
-    } catch (_) {}
+    }
   }
 
   try {
     bot.stop(signal);
-  } catch (_) {}
-
-  /*
-   * Give active streams a moment to close before
-   * removing the temporary directory.
-   */
-
-  await new Promise(
-    resolve =>
-      setTimeout(resolve, 500)
-  );
+  } catch (error) {
+    console.error(
+      '[BOT STOP ERROR]',
+      error
+    );
+  }
 
   try {
-    await fs.remove(
-      TEMP_DIR
+    await fs.remove(TEMP_DIR);
+  } catch (error) {
+    console.error(
+      '[TEMP DIRECTORY CLEANUP ERROR]',
+      error
     );
-  } catch (_) {}
+  }
 
   process.exit(0);
 }
 
 process.once(
   'SIGINT',
-  () => {
-    gracefulShutdown(
-      'SIGINT'
-    ).catch(() =>
-      process.exit(0)
-    );
-  }
+  () => shutdown('SIGINT')
 );
 
 process.once(
   'SIGTERM',
-  () => {
-    gracefulShutdown(
-      'SIGTERM'
-    ).catch(() =>
-      process.exit(0)
-    );
-  }
+  () => shutdown('SIGTERM')
 );
-
-// ============================================================
-// START
-// ============================================================
-
-bot.launch()
-  .then(() => {
-    console.log(
-      '🤖 Telegram MEGA Downloader Bot is running.'
-    );
-
-    console.log(
-      `[TEMP] ${TEMP_DIR}`
-    );
-  })
-  .catch(err => {
-    console.error(
-      '[BOT START ERROR]',
-      err
-    );
-
-    process.exit(1);
-  });
