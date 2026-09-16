@@ -1549,21 +1549,23 @@ bot.on('text', async ctx => {
 
     // If the URL points directly to a nested folder/file,
     // locate it asynchronously through the MEGA tree.
-    if (
-      parsed.targetId &&
-      parsed.targetId !== parsed.rootId
-    ) {
-      const target =
-        await findNodeByIdAsync(
-          rootFolder,
-          parsed.targetId
-        );
+    const rootUrl =
+  `https://mega.nz/folder/${parsed.rootId}#${parsed.key}`;
 
-      if (!target) {
-        throw new Error(
-          'The requested folder or file could not be found inside this MEGA share.'
-        );
-      }
+const rootFolder =
+  await loadMegaFolder(rootUrl);
+
+if (session.generation !== generation) {
+  return;
+}
+
+session.rootNode = rootFolder;
+session.currentFolder = rootFolder;
+session.pathStack = [];
+session.selectedIds.clear();
+session.page = 0;
+
+await renderBrowserUI(ctx);
 
       if (isDirectory(target)) {
         const pathToTarget =
