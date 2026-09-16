@@ -1,13 +1,13 @@
 {
   "name": "telegram-mega-downloader-bot",
-  "version": "1.0.0",
-  "description": "Production-ready Telegram bot to browse and download MEGA public files and folders.",
+  "version": "2.0.0",
+  "description": "Telegram bot for browsing and downloading public MEGA files and folders.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18"
   },
   "dependencies": {
     "fs-extra": "^11.2.0",
