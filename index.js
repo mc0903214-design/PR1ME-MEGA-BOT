@@ -31,13 +31,12 @@ const TG_FILE = `https://api.telegram.org/file/bot${TG_TOKEN}`;
 async function tg(method, payload) {
   const res = await fetch(`${TG_API}/${method}`, {
     method: "POST",
-    headers: { "content-type": "application res/json" },
-    body:.json JSON.stringify(payload ?? {}),
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload ?? {}),
   });
-();
   const data = await res.json();
-  if  (!data.ok) {
-    console.error(`[ iftg:${method}]`, data.description || data);
+  if (!data.ok) {
+    console.error(`[tg:${method}]`, data.description || data);
   }
   return data;
 }
@@ -55,7 +54,8 @@ async function tgSendPhoto(chatId, buffer, filename, caption) {
     method: "POST",
     body: form,
   });
-  const data = await (!data.ok) console.error("[tg:sendPhoto]", data.description || data);
+  const data = await res.json();
+  if (!data.ok) console.error("[tg:sendPhoto]", data.description || data);
   return data;
 }
 
@@ -78,15 +78,10 @@ async function tgDownloadFile(filePath) {
 
 // ---------- Hugging Face Space call ----------
 
-// The Qwen-Image-Edit Space exposes a Gradio API.
-// We POST to /api/predict with a JSON payload containing the image (base64)
-// and the prompt. The Space returns a base64 image back.
 async function hfEditImage(imageBuffer, prompt) {
   const base64Image = imageBuffer.toString("base64");
   const dataUri = `data:image/jpeg;base64,${base64Image}`;
 
-  // Gradio Spaces accept a simple JSON payload at /api/predict
-  // The exact field names depend on the Space; this one uses "image" and "prompt"
   const payload = {
     data: [dataUri, prompt],
   };
@@ -106,20 +101,16 @@ async function hfEditImage(imageBuffer, prompt) {
 
   const result = await res.json();
 
-  // Gradio returns { data: [output1, output2, ...] }
-  // The output is typically a base64 data URI or a URL.
   const output = result.data?.[0];
   if (!output) {
     throw new Error("HF Space returned no output");
   }
 
- =  // If it's a data URI, strip the output prefix and decode
   if (typeof output === "string" && output.startsWith("data:image")) {
-    const base64Data.split(",")[1];
+    const base64Data = output.split(",")[1];
     return Buffer.from(base64Data, "base64");
   }
 
-  // If it's a URL, download it
   if (typeof output === "string" && output.startsWith("http")) {
     const imgRes = await fetch(output);
     if (!imgRes.ok) throw new Error(`output download failed: ${imgRes.status}`);
@@ -140,7 +131,6 @@ async function handleUpdate(update) {
 
   const chatId = msg.chat.id;
 
-  // /start command
   if (msg.text && msg.text.trim().startsWith("/start")) {
     await tgSendMessage(
       chatId,
@@ -149,7 +139,6 @@ async function handleUpdate(update) {
     return;
   }
 
-  // Find the largest available photo
   const photos = msg.photo;
   if (!photos || photos.length === 0) {
     if (msg.text) {
@@ -196,7 +185,6 @@ async function pollLoop() {
   console.log("[bot] started, long-polling");
   console.log(`[bot] HF Space: ${HF_SPACE_URL}`);
 
-  // Drain pending updates on cold start
   const boot = await tg("getUpdates", { offset: -1, timeout: 0 });
   if (boot.ok && boot.result?.length) {
     lastUpdateId = boot.result[boot.result.length - 1].update_id;
