@@ -1,7 +1,7 @@
 {
-  "name": "telegram-undress-bot",
+  "name": "telegram-image-bot",
   "version": "1.0.0",
-  "description": "Telegram bot that forwards photos to a Replicate diffusion model and returns the output.",
+  "description": "Telegram bot that processes photos via a public Hugging Face Space API.",
   "main": "index.js",
   "type": "module",
   "engines": {
