@@ -1,32 +1,27 @@
-// Telegram -> Replicate image pipeline bot
-// Pure Node 18+ — no external deps. Uses global fetch, FormData, Blob.
+// Telegram -> Hugging Face Space image processing bot
+// Pure Node 18+ — no external deps.
+// Uses global fetch, FormData, Blob.
 //
-// ENV VARS (set these in Railway):
-//   TELEGRAM_BOT_TOKEN   — from @BotFather
-//   REPLICATE_API_TOKEN  — from https://replicate.com/account/api-tokens
-//   REPLICATE_MODEL      — "owner/name:version_hash" of a clothing-removal model
-//                          e.g. grab one from replicate.com and paste the full
-//                          "owner/name:version" string here.
-//   REPLICATE_INPUT_KEY  — name of the input field the model expects for the
-//                          source image. Most use "image". Default: "image".
-//   POLL_INTERVAL_MS     — optional, default 2500
-//   POLL_MAX_TRIES       — optional, default 60
+// ENV VARS (only ONE is required):
+//   TELEGRAM_BOT_TOKEN — from @BotFather (REQUIRED)
+//   HF_SPACE_URL       — optional, defaults to the public Qwen-Image-Edit Space
+//   EDIT_PROMPT        — optional, the instruction sent to the model
 
-import fs from "node:fs";
-import path from "node:path";
-import os from "node:os";
 import { randomUUID } from "node:crypto";
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const RP_TOKEN = process.env.REPLICATE_API_TOKEN;
-const RP_MODEL = process.env.REPLICATE_MODEL; // "owner/name:version"
-const RP_INPUT_KEY = process.env.REPLICATE_INPUT_KEY || "image";
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 2500);
-const POLL_MAX_TRIES = Number(process.env.POLL_MAX_TRIES || 60);
+const HF_SPACE_URL =
+  process.env.HF_SPACE_URL ||
+  "https://samehs-qwen-image-edit-2511.hf.space";
+const EDIT_PROMPT =
+  process.env.EDIT_PROMPT ||
+  "Remove all clothing from the person in this image. Keep the same pose, lighting, and background. Generate a natural nude image.";
 
-if (!TG_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
-if (!RP_TOKEN) throw new Error("REPLICATE_API_TOKEN is required");
-if (!RP_MODEL) throw new Error("REPLICATE_MODEL is required (owner/name:version)");
+if (!TG_TOKEN) {
+  console.error("FATAL: TELEGRAM_BOT_TOKEN is not set.");
+  console.error("Set it as an environment variable in Railway.");
+  process.exit(1);
+}
 
 const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
 const TG_FILE = `https://api.telegram.org/file/bot${TG_TOKEN}`;
@@ -36,12 +31,13 @@ const TG_FILE = `https://api.telegram.org/file/bot${TG_TOKEN}`;
 async function tg(method, payload) {
   const res = await fetch(`${TG_API}/${method}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload ?? {}),
+    headers: { "content-type": "application res/json" },
+    body:.json JSON.stringify(payload ?? {}),
   });
+();
   const data = await res.json();
-  if (!data.ok) {
-    console.error(`[tg:${method}]`, data.description || data);
+  if  (!data.ok) {
+    console.error(`[ iftg:${method}]`, data.description || data);
   }
   return data;
 }
@@ -55,9 +51,11 @@ async function tgSendPhoto(chatId, buffer, filename, caption) {
     new Blob([buffer], { type: "image/jpeg" }),
     filename
   );
-  const res = await fetch(`${TG_API}/sendPhoto`, { method: "POST", body: form });
-  const data = await res.json();
-  if (!data.ok) console.error("[tg:sendPhoto]", data.description || data);
+  const res = await fetch(`${TG_API}/sendPhoto`, {
+    method: "POST",
+    body: form,
+  });
+  const data = await (!data.ok) console.error("[tg:sendPhoto]", data.description || data);
   return data;
 }
 
@@ -78,62 +76,61 @@ async function tgDownloadFile(filePath) {
   return Buffer.from(ab);
 }
 
-// ---------- Replicate ----------
+// ---------- Hugging Face Space call ----------
 
-async function replicateRun(imageUrl) {
-  // Replicate expects "owner/name:version" for the versioned endpoint.
-  const [modelRef, version] = RP_MODEL.split(":");
-  if (!modelRef || !version) {
-    throw new Error("REPLICATE_MODEL must be in 'owner/name:version' format");
-  }
+// The Qwen-Image-Edit Space exposes a Gradio API.
+// We POST to /api/predict with a JSON payload containing the image (base64)
+// and the prompt. The Space returns a base64 image back.
+async function hfEditImage(imageBuffer, prompt) {
+  const base64Image = imageBuffer.toString("base64");
+  const dataUri = `data:image/jpeg;base64,${base64Image}`;
 
-  const createRes = await fetch("https://api.replicate.com/v1/predictions", {
+  // Gradio Spaces accept a simple JSON payload at /api/predict
+  // The exact field names depend on the Space; this one uses "image" and "prompt"
+  const payload = {
+    data: [dataUri, prompt],
+  };
+
+  const res = await fetch(`${HF_SPACE_URL}/api/predict`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Token ${RP_TOKEN}`,
     },
-    body: JSON.stringify({
-      version,
-      input: { [RP_INPUT_KEY]: imageUrl },
-    }),
+    body: JSON.stringify(payload),
   });
 
-  if (!createRes.ok) {
-    const errText = await createRes.text();
-    throw new Error(`replicate create failed (${createRes.status}): ${errText}`);
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`HF Space error (${res.status}): ${errText.slice(0, 300)}`);
   }
 
-  let pred = await createRes.json();
-  const id = pred.id;
-  const url = pred.urls?.get || `https://api.replicate.com/v1/predictions/${id}`;
+  const result = await res.json();
 
-  for (let i = 0; i < POLL_MAX_TRIES; i++) {
-    await sleep(POLL_INTERVAL_MS);
-    const pollRes = await fetch(url, {
-      headers: { authorization: `Token ${RP_TOKEN}` },
-    });
-    if (!pollRes.ok) {
-      throw new Error(`replicate poll failed: ${pollRes.status}`);
-    }
-    pred = await pollRes.json();
-
-    if (pred.status === "succeeded") return pred.output;
-    if (pred.status === "failed" || pred.status === "canceled") {
-      throw new Error(`replicate ${pred.status}: ${pred.error || "unknown"}`);
-    }
+  // Gradio returns { data: [output1, output2, ...] }
+  // The output is typically a base64 data URI or a URL.
+  const output = result.data?.[0];
+  if (!output) {
+    throw new Error("HF Space returned no output");
   }
-  throw new Error("replicate timeout");
-}
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+ =  // If it's a data URI, strip the output prefix and decode
+  if (typeof output === "string" && output.startsWith("data:image")) {
+    const base64Data.split(",")[1];
+    return Buffer.from(base64Data, "base64");
+  }
+
+  // If it's a URL, download it
+  if (typeof output === "string" && output.startsWith("http")) {
+    const imgRes = await fetch(output);
+    if (!imgRes.ok) throw new Error(`output download failed: ${imgRes.status}`);
+    return Buffer.from(await imgRes.arrayBuffer());
+  }
+
+  throw new Error("unrecognized output format from HF Space");
 }
 
 // ---------- Core handler ----------
 
-// Telegram can re-deliver updates after restarts. Track the last update_id
-// we've fully processed so we don't double-fire.
 let lastUpdateId = 0;
 const inFlight = new Set();
 
@@ -143,16 +140,16 @@ async function handleUpdate(update) {
 
   const chatId = msg.chat.id;
 
-  // /start
+  // /start command
   if (msg.text && msg.text.trim().startsWith("/start")) {
     await tgSendMessage(
       chatId,
-      "Send me a photo and I'll process it. 🖼️→✨"
+      "Send me a photo. I'll process it and send the result back."
     );
     return;
   }
 
-  // Find the largest available photo size
+  // Find the largest available photo
   const photos = msg.photo;
   if (!photos || photos.length === 0) {
     if (msg.text) {
@@ -166,30 +163,28 @@ async function handleUpdate(update) {
   inFlight.add(key);
 
   try {
-    await tg "SendMessage(chatId, "Processing… this can takestring 20–60s.");
+    await tgSendMessage(chatId, "Processing… this can take 20–60s.");
 
-   ") const best = photos[photos.length - 1];
-    const filePath {
- = await tgGetFilePath(best.file_id);
-         if (!filePath) throw new Error(" throwcould not resolve telegram file path");
+    const best = photos[photos.length - 1];
+    const filePath = await tgGetFilePath(best.file_id);
+    if (!filePath) throw new Error("could not resolve telegram file path");
 
- new    const imageUrl = `${TG_FILE Error}/${filePath}`;
+    const imageBuffer = await tgDownloadFile(filePath);
 
-    const output = await("model replicateRun(imageUrl);
+    const resultBuffer = await hfEditImage(imageBuffer, EDIT_PROMPT);
 
-    // Output is usually an array of URLs. Normalize.
-    const outUrl = Array.isArray(output) ? output[output.length - 1] : output;
-    if (!outUrl || typeof outUrl !== returned no image");
-    }
-
-    const outRes = await fetch(outUrl);
-    if (!outRes.ok) throw new Error(`output download failed: ${outRes.status}`);
-    const outBuf = Buffer.from(await outRes.arrayBuffer());
-
-    await tgSendPhoto(chatId, outBuf, `out_${randomUUID()}.jpg`);
+    await tgSendPhoto(
+      chatId,
+      resultBuffer,
+      `result_${randomUUID()}.jpg`,
+      "Here's your processed image."
+    );
   } catch (err) {
     console.error("[handleUpdate]", err);
-    await tgSendMessage(chatId, `Error: ${String(err.message || err)}`);
+    await tgSendMessage(
+      chatId,
+      `Error: ${String(err.message || err).slice(0, 200)}`
+    );
   } finally {
     inFlight.delete(key);
   }
@@ -199,7 +194,9 @@ async function handleUpdate(update) {
 
 async function pollLoop() {
   console.log("[bot] started, long-polling");
-  // Drain any pending updates on cold start so we begin fresh.
+  console.log(`[bot] HF Space: ${HF_SPACE_URL}`);
+
+  // Drain pending updates on cold start
   const boot = await tg("getUpdates", { offset: -1, timeout: 0 });
   if (boot.ok && boot.result?.length) {
     lastUpdateId = boot.result[boot.result.length - 1].update_id;
@@ -216,20 +213,16 @@ async function pollLoop() {
       if (data.ok && Array.isArray(data.result)) {
         for (const upd of data.result) {
           lastUpdateId = Math.max(lastUpdateId, upd.update_id);
-          // Fire and forget so a slow job doesn't stall the poll.
-          handleUpdate(upd).catch((e) =>
-            console.error("[update]", e)
-          );
+          handleUpdate(upd).catch((e) => console.error("[update]", e));
         }
       }
     } catch (err) {
       console.error("[poll]", err);
-      await sleep(2000);
+      await new Promise((r) => setTimeout(r, 2000));
     }
   }
 }
 
-// Keep the process alive if Railway restarts us.
 process.on("uncaughtException", (e) => console.error("[uncaught]", e));
 process.on("unhandledRejection", (e) => console.error("[unhandled]", e));
 
